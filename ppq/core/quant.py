@@ -11,8 +11,6 @@ from abc import abstractmethod
 from enum import Enum
 from typing import Any, Iterable, List
 
-import torch
-
 from .storage import Serializable
 
 
@@ -28,7 +26,7 @@ class TargetPlatform(Enum):
     """
     TargetPlatform is a core abstraction of PPQ framework,
         it defines "platform" as an attribute of an operation.
-    Platform attribute of an operation indicates where this operation is going to be deployed.
+    Platform attribute of an operation indicates where this operation is going to be depoly.
     This feature enables PPQ to simulate inter-device computing.
 
     Platform attribute also tells PPQ how to quantize an operation, and how to execute it.
@@ -41,7 +39,7 @@ class TargetPlatform(Enum):
     SHAPE_OR_INDEX is a virtual platform, however it is an EXTREMELY IMPORTANT components in PPQ.
         Dispatch an operation to platform SHAPE_OR_INDEX means this operation is SOI-related,
         it processes a SOI tensor and gives a processed SOI, all calculation of this operation must be sent to CPU
-            (or any platform capable for calculating this.) when deploy.
+            (or any platform capable for calculating this.) when depoly.
 
         An operation with SHAPE_OR_INDEX platform assigned will never be quantized regardless of its type.
         It is a crucial feature for quantizing network that contains SOI-related operation. (Shufflenet etc.)
@@ -53,29 +51,19 @@ class TargetPlatform(Enum):
         Quantizer then dispatches them towards desired platform through its quantization logic.
     """
     TRT_INT8  = 101
+    TRT_INT4  = 102
+    TRT_FP16  = 103
     
-    PPL_CUDA_INT8 = 201 
-    PPL_CUDA_INT4 = 202 
-    PPL_CUDA_FP16 = 203 
-    PPL_CUDA_MIX  = 204 
+    PPL_CUDA_INT8 = 201
+    PPL_CUDA_INT4 = 202
+    PPL_CUDA_FP16 = 203
 
-    PPL_DSP_INT8  = 301
-    SNPE_INT8 = 302
-    PPL_DSP_TI_INT8 = 303
-    QNN_DSP_INT8  = 304
+    DSP_INT8  = 301
 
-    HOST_INT8 = 401
+    HOST_INT8 = 402
 
     NXP_INT8  = 501
-    FPGA_INT8 = 502
-
-    ORT_OOS_INT8 = 601
-
-    METAX_INT8_C = 701 # channel wise
-    METAX_INT8_T = 702 # tensor wise
-
-    HEXAGON_INT8 = 801
-
+    
     FP32 = 0
     # SHAPE-OR-INDEX related operation
     SHAPE_OR_INDEX = -1
@@ -87,20 +75,15 @@ class TargetPlatform(Enum):
     ONNX          = -4
     CAFFE         = -5
     NATIVE        = -6
-    ONNXRUNTIME   = -7
+    
     # THIS IS A DUUMY PLATFORM JUST FOR CREATING YOUR OWN EXTENSTION.
     EXTENSION     = -10086
     
-    ACADEMIC_INT8 = 10081
-    ACADEMIC_INT4 = 10082
-    ACADEMIC_MIX  = 10083
-    
+
     @ classmethod
     def is_quantized_platform(cls, platform) -> bool:
-        return platform in {
-            cls.PPL_DSP_INT8, cls.PPL_DSP_TI_INT8, cls.QNN_DSP_INT8, cls.TRT_INT8, cls.NXP_INT8, cls.SNPE_INT8,
-            cls.PPL_CUDA_INT8, cls.PPL_CUDA_INT4, cls.EXTENSION, cls.PPL_CUDA_MIX, cls.ORT_OOS_INT8,
-            cls.ACADEMIC_INT4, cls.ACADEMIC_INT8, cls.ACADEMIC_MIX, cls.METAX_INT8_C, cls.METAX_INT8_T}
+        return platform in {cls.DSP_INT8, cls.TRT_INT4, cls.TRT_INT8, cls.NXP_INT8, 
+                            cls.PPL_CUDA_INT8, cls.PPL_CUDA_INT4, cls.EXTENSION}
 
 
 class RoundingPolicy(Enum):
@@ -231,7 +214,7 @@ class QuantizationPolicy:
             )
         self._policy = policy
 
-    def has_property(self, property: QuantizationProperty) -> bool:
+    def has_property(self, property: QuantizationProperty):
         return (self._policy & property.value) != 0
 
     @ classmethod
@@ -249,16 +232,6 @@ class QuantizationPolicy:
             QuantizationProperty.SYMMETRICAL | QuantizationProperty.LINEAR | QuantizationProperty.PER_TENSOR | QuantizationProperty.POWER_OF_2,
             QuantizationProperty.ASYMMETRICAL | QuantizationProperty.LINEAR | QuantizationProperty.PER_CHANNEL | QuantizationProperty.POWER_OF_2,
             QuantizationProperty.SYMMETRICAL | QuantizationProperty.LINEAR | QuantizationProperty.PER_CHANNEL | QuantizationProperty.POWER_OF_2,
-        }
-    
-    def to_dict(self) -> dict:
-        """
-        return a dictionary to describe this policy.
-            nothing funny.
-        """
-        return {
-            property.name: self.has_property(property)
-            for property in QuantizationProperty
         }
 
 
@@ -312,19 +285,18 @@ class QuantizationStates(Enum):
     INITIAL     = 1   # 量化参数刚刚被初始化，当前 config 不生效，数据不能被使用
     BAKED       = 2   # 只针对参数量化，表示参数已经被静态量化，当前 config 不生效，数据可以直接使用
     OVERLAPPED  = 3   # 只针对activation量化，表示数据流的量化由其他 config 管理，当前 config 不生效
-    SLAVE       = 4   # 只针对activation量化，表示当前数据流处于强制联合定点，当前 config 生效
-    DEACTIVATED = 5   # 表示当前 config 不生效
-    ACTIVATED   = 6   # 表示当前 config 生效
-    DEQUANTIZED = 7   # 表示当前 config 处于解量化状态，解量化是 PPQ 的一个系统操作
-    SOI         = 8   # 表示这一路输入与 Shape or index 相关，不量化
-    PASSIVE     = 9   # 表示这一路输入被动量化，如 bias, clip value 等
-    PASSIVE_INIT = 10  # 表示这一路输入被动量化，并且刚刚初始化不能被使用
-    PASSIVE_BAKED = 11 # 被动量化且静态量化，当前config不生效，数据可以直接使用
-    FP32        = 12   # 表示这一路输入直接为FP32浮点数
+    DEACTIVATED = 4   # 表示当前 config 不生效
+    ACTIVATED   = 5   # 表示当前 config 生效
+    DEQUANTIZED = 6   # 表示当前 config 处于解量化状态，解量化是 PPQ 中的一个系统操作
+    SOI         = 7   # 表示这一路输入与 Shape or index 相关，不量化
+    PASSIVE     = 8   # 表示这一路输入被动量化，如 bias, clip value 等
+    PASSIVE_INIT = 9  # 表示这一路输入被动量化，并且刚刚初始化不能被使用
+    PASSIVE_BAKED = 10 # 被动量化且静态量化，当前config不生效，数据可以直接使用
+    FP32        = 11   # 表示这一路输入直接为FP32浮点数
 
     @ classmethod
     def is_activated(cls, state)->bool:
-        return state in {QuantizationStates.ACTIVATED, QuantizationStates.PASSIVE, QuantizationStates.SLAVE}
+        return state in {QuantizationStates.ACTIVATED, QuantizationStates.PASSIVE}
 
     @ classmethod
     def can_export(cls, state)->bool:
@@ -481,43 +453,19 @@ class TensorQuantizationConfig(Serializable):
         assert isinstance(o, TensorQuantizationConfig), (
             'Can only set this attribute with another tensor config.')
         root, dominator = self.dominated_by, o.dominated_by
-        assert isinstance(root, TensorQuantizationConfig)
         if dominator != root:
             root._father_config = dominator
             self._father_config = dominator
             root.state = QuantizationStates.OVERLAPPED
             self.state = QuantizationStates.OVERLAPPED
 
-    def set_master(self, master, recursive: bool = False):
-        assert isinstance(master, TensorQuantizationConfig), (
-            'Can only set this attribute with another tensor config.')
-        assert master.state in {QuantizationStates.ACTIVATED, QuantizationStates.OVERLAPPED, QuantizationStates.SLAVE}, (
-            f'Quantization State of master must be ACTIVATED or SLAVE, however {master.state.name} was given.')
-        if recursive:
-            root = self.dominated_by
-            root.state = QuantizationStates.SLAVE
-            root._father_config = master
-        else:
-            self._father_config = master
-            self.state = QuantizationStates.SLAVE
-
-    def __is_revisable(self):
-        return (self.dominated_by == self and self.state in {
-            QuantizationStates.ACTIVATED,
-            QuantizationStates.DEQUANTIZED,
-            QuantizationStates.DEACTIVATED,
-            QuantizationStates.INITIAL,
-            QuantizationStates.PASSIVE_INIT,
-            QuantizationStates.PASSIVE
-        })
-
     @ property
-    def scale(self) -> torch.Tensor:
+    def scale(self) -> Any:
         if self.dominated_by == self: return self._scale
         else: return self.dominated_by.scale
 
     @ property
-    def offset(self) -> torch.Tensor:
+    def offset(self) -> Any:
         if self.dominated_by == self: return self._offset
         else: return self.dominated_by.offset
 
@@ -546,117 +494,75 @@ class TensorQuantizationConfig(Serializable):
         if self.dominated_by == self: return self._quant_max
         else: return self.dominated_by.quant_max
 
-    @ property
-    def delegate(self) -> int:
-        if self.dominated_by == self: return self._quant_max
-        else: return self.dominated_by.quant_max
-
     @ scale.setter
     def scale(self, value: Any):
-        if not self.__is_revisable():
+        if self.dominated_by != self:
             raise PermissionError(
-                'Can not change scale of this tensor quantization configuration now. '
-                'It has been overlapped or has an inactive state. '
-                'Due to it is not a active config, any change of this configuration is not allowed.'
-            )
+                f'You are trying to edit property of a tensor quantization configuration({self}). '
+                f'While this configuration has been dominated by {self.dominated_by}. '
+                'Cause being overlapped, any change of this configuration is not allowed.')
         else:
             self._scale = value
     
     @ offset.setter
     def offset(self, value: Any):
-        if not self.__is_revisable():
+        if self.dominated_by != self:
             raise PermissionError(
-                'Can not change offset of this tensor quantization configuration now. '
-                'It has been overlapped or has an inactive state. '
-                'Due to it is not a active config, any change of this configuration is not allowed.'
-            )
+                f'You are trying to edit property of a tensor quantization configuration({self}). '
+                f'While this configuration has been dominated by {self.dominated_by}. '
+                'Cause being overlapped, any change of this configuration is not allowed.')
         else:
             self._offset = value
     
     @ policy.setter
     def policy(self, policy: QuantizationPolicy):
-        if not self.__is_revisable():
+        if self.dominated_by != self:
             raise PermissionError(
-                'Can not change policy of this tensor quantization configuration now. '
-                'It has been overlapped or has an inactive state. '
-                'Due to it is not a active config, any change of this configuration is not allowed.'
-            )
+                f'You are trying to edit property of a tensor quantization configuration({self}). '
+                f'While this configuration has been dominated by {self.dominated_by}. '
+                'Cause being overlapped, any change of this configuration is not allowed.')
         else:
             self._policy = policy
 
     @ num_of_bits.setter
     def num_of_bits(self, bits: int):
-        if not self.__is_revisable():
+        if self.dominated_by != self:
             raise PermissionError(
-                'Can not change num_of_bits of this tensor quantization configuration now. '
-                'It has been overlapped or has an inactive state. '
-                'Due to it is not a active config, any change of this configuration is not allowed.'
-            )
+                f'You are trying to edit property of a tensor quantization configuration({self}). '
+                f'While this configuration has been dominated by {self.dominated_by}. '
+                'Cause being overlapped, any change of this configuration is not allowed.')
         else:
             self._num_of_bits = bits
 
     @ rounding.setter
     def rounding(self, policy: RoundingPolicy):
-        if not self.__is_revisable():
+        if self.dominated_by != self:
             raise PermissionError(
-                'Can not change rounding of this tensor quantization configuration now. '
-                'It has been overlapped or has an inactive state. '
-                'Due to it is not a active config, any change of this configuration is not allowed.'
-            )
+                f'You are trying to edit property of a tensor quantization configuration({self}). '
+                f'While this configuration has been dominated by {self.dominated_by}. '
+                'Cause being overlapped, any change of this configuration is not allowed.')
         else:
             self._rounding = policy
 
     @ quant_min.setter
     def quant_min(self, min: int):
-        if not self.__is_revisable():
+        if self.dominated_by != self:
             raise PermissionError(
-                'Can not change quant_min of this tensor quantization configuration now. '
-                'It has been overlapped or has an inactive state. '
-                'Due to it is not a active config, any change of this configuration is not allowed.'
-            )
+                f'You are trying to edit property of a tensor quantization configuration({self}). '
+                f'While this configuration has been dominated by {self.dominated_by}. '
+                'Cause being overlapped, any change of this configuration is not allowed.')
         else:
             self._quant_min = min
 
     @ quant_max.setter
     def quant_max(self, max: int):
-        if not self.__is_revisable():
+        if self.dominated_by != self:
             raise PermissionError(
-                'Can not change quant_max of this tensor quantization configuration now. '
-                'It has been overlapped or has an inactive state. '
-                'Due to it is not a active config, any change of this configuration is not allowed.'
-            )
+                f'You are trying to edit property of a tensor quantization configuration({self}). '
+                f'While this configuration has been dominated by {self.dominated_by}. '
+                'Cause being overlapped, any change of this configuration is not allowed.')
         else:
             self._quant_max = max
-    
-    def copy(self):
-        """
-            Create a tensor config from this one, keep policy and state unchanged.
-            if there is an non-empty scale and offset, they will be cloned too.
-        """
-        scale, offset = None, None
-        if self.scale is not None:
-            if isinstance(self.scale, torch.Tensor):
-                scale = self.scale.clone()
-            else: scale = self.scale
-        if self.offset is not None:
-            if isinstance(self.offset, torch.Tensor):
-                offset = self.scale.clone()
-            else: offset = self.offset
-        config = TensorQuantizationConfig(
-            policy=self.policy,
-            rounding=self.rounding,
-            num_of_bits=self.num_of_bits,
-            quant_min=self.quant_min,
-            quant_max=self.quant_max,
-            scale=scale, offset=offset,
-            observer_algorithm=self.observer_algorithm,
-            detail=self.detail.copy(),
-            inplace=self.inplace,
-            state=self.state
-        )
-        if self.state == QuantizationStates.OVERLAPPED:
-            config._father_config = self._father_config
-        return config
 
 
 class ChannelwiseTensorQuantizationConfig(TensorQuantizationConfig):
@@ -703,18 +609,12 @@ class ChannelwiseTensorQuantizationConfig(TensorQuantizationConfig):
             quant_max=convert_from.quant_max,
             scale=scales, offset=offsets,
             observer_algorithm=convert_from.observer_algorithm,
-            detail=convert_from.detail.copy(),
+            detail=convert_from.detail,
             state=convert_from.state,
             channel_axis=channel_axis,
             rounding=convert_from.rounding
         )
         return this
-    
-    def copy(self):
-        config = super().copy()
-        return self.convert_from_tensor_config(
-            config, scales=config.scale, offsets=config.offset,
-            channel_axis=self.channel_axis)
 
 
 class OperationQuantizationConfig(Iterable):
@@ -768,14 +668,3 @@ class OperationQuantizationConfig(Iterable):
 
     def __iter__(self) -> TensorQuantizationConfig:
         return (self.input_quantization_config + self.output_quantization_config).__iter__()
-
-    def copy(self):
-        """
-            Create an operation config from this one, keep policy and state unchanged.
-            if this one has an non-empty scale or offset, they will be cloned too.
-        """
-        return OperationQuantizationConfig(
-            input_quantization_configs=[_.copy() for _ in self.input_quantization_config],
-            output_quantization_configs=[_.copy() for _ in self.output_quantization_config],
-            is_positive_quant_op=self.is_active_quant_op
-        )
