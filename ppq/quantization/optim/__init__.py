@@ -1,17 +1,12 @@
 from .baking import ConstantBakingPass, ParameterBakingPass
 from .base import (QuantizationOptimizationPass,
                    QuantizationOptimizationPipeline)
-from .calibration import RuntimeCalibrationPass, RuntimePerlayerCalibrationPass, PPLDSPTIReCalibrationPass
+from .calibration import RuntimeCalibrationPass, RuntimePerlayerCalibrationPass
 from .equalization import LayerwiseEqualizationPass
-from .extension import ExtensionPass
-from .morph import (ChannelSplitPass, WeightSplitPass, MatrixFactorizationPass,
-                    NXPResizeModeChangePass)
-from .parameters import ParameterQuantizePass, PassiveParameterQuantizePass
-from .refine import (QuantAlignmentPass, InplaceQuantizationSettingPass,
-                     NxpInputRoundingRefinePass, NxpQuantizeFusionPass,
-                     PPLCudaAddConvReluMerge, QuantizeFusionPass,
-                     QuantizeReducePass, QuantizeRefinePass)
+from .morph import NXPResizeModeChangePass, ChannelSplitPass
+from .parameters import PassiveParameterQuantizePass, ParameterQuantizePass
+from .refine import (NxpInputRoundingRefinePass, NxpQuantizeFusionPass,
+                     QuantizeFusionPass, QuantizeReducePass,
+                     QuantizeRefinePass, InplaceQuantizationSettingPass)
+from .training import AdvancedQuantOptimization, AdaRoundPass, BiasCorrectionPass
 from .ssd import SSDEqualizationPass
-from .training import (AdaRoundPass, AdvancedQuantOptimization,
-                       BiasCorrectionPass, BlockwiseReconstructionPass,
-                       LearningStepSizeOptimization)

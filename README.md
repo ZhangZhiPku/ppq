@@ -1,42 +1,42 @@
+# PPL Quantization Tool(PPL 量化工具)
 
-<div align="center">
-  <img src="doc/assets/img/banner.jpg" width="1280"/>
-</div>
+PPL Quantization Tool (PPQ) is a powerful offline neural network quantization tool with custimized IR, executor, dispacher and optimization passes.
 
-# PPL Quantization Tool 0.6.4(PPL 量化工具)
-PPL QuantTool (PPQ) is a highly efficient neural network quantization tool with custimized IR, cuda based executor, automatic dispacher and powerful optimization passes. Together with OpenPPL ecosystem, we offer you this industrial-grade network deploy tool that empowers AI developers to unleash the full potential of AI hardware. With quantization and other optimizations, nerual network model can run 5~10x faster than ever.
+# Features
 
-PPL QuantTool 是一个工业级的神经网络量化工具：我们已经准备好了为你处理 maskrcnn 中复杂算子调度问题；esrgan 中的全网联合定点问题；或者是 transformer 中的大规模递归图融合，PPQ能够处理这些最复杂的网络量化任务，确保你的模型能够稳定部署在目标设备上。
-
-PPQ 使用量化计算图(QIR)描述量化细节，即便在网络极度复杂的情况下，我们依然能够保证以正确的方法模拟硬件计算，从而降低模拟误差。我们知晓硬件的运算细节——在所有已知平台上，PPQ 的模拟误差不超过1%，且保证模拟误差不会指数级扩散。PPQ 有着自定义的量化算子库、网络执行器、调度器与异构执行能力，在网络量化与量化训练方面，使用 PPQ 比原生 PyTorch 快3 ~ 50倍。 借助 PPQ, OpenPPL, TensorRT, Tengine等框架，开发者可以将神经网络模型加速5 ~ 10倍，并部署到多种多样的目标终端，我们期待你将人工智慧真正带到千家万户之间。
-
-### Acceptable Framework: 
-PyTorch | TensorFlow | Caffe | ONNX | MMlab
-
-### Deploy Platform:
-TensorRT | OpenPPL-CUDA | OpenPPL-DSP | SNPE(Qualcomm) | NXP | Metax | Tengine(Developing)
-
-# Tutorial(Bilibili 视频教程)
-Watch video tutorial series on www.bilibili.com, following are links of PPQ tutorial links(Only Chinese version).
-
-* 安装教程: [https://www.bilibili.com/video/BV1WS4y1N7Kn](https://www.bilibili.com/video/BV1WS4y1N7Kn "PPQ Installation Tutorial") 
-* 使用教程: [https://www.bilibili.com/video/BV1934y147p2](https://www.bilibili.com/video/BV1934y147p2 "PPQ User Guide") 
-* 基础知识：[https://www.bilibili.com/video/BV1gS4y1Y7KR](https://www.bilibili.com/video/BV1gS4y1Y7KR "Basic Theory") 
-* 网络性能分析：[https://www.bilibili.com/video/BV1oT4y1h73e](https://www.bilibili.com/video/BV1oT4y1h73e "Analysing Your Model") 
-* 量化计算原理(Part 1)：[https://www.bilibili.com/video/BV1fB4y1m7fJ](https://www.bilibili.com/video/BV1fB4y1m7fJ "Quantized Computing") 
-* 量化计算原理(Part 2)：[https://www.bilibili.com/video/BV1qA4y1Q7Uh](https://www.bilibili.com/video/BV1qA4y1Q7Uh "Quantized Computing") 
-* 图优化与量化模拟：[https://www.bilibili.com/video/BV1Kr4y1n7cy](https://www.bilibili.com/video/BV1Kr4y1n7cy "Graph Optimization & quantization simulating.") 
-
-* 其他教程: 等待缓慢更新...
+* Quantable graph, an quantization-oriented network representation.
+* Quantize with Cuda, quantization simulating are 3x ~ 50x faster than PyTorch.
+* Hardware-friendly, simulating calculations are mostly identical with hardware.
+* Multi-platform support.
 
 # Installation
 
 To release the power of this advanced quantization tool, at least one CUDA computing device is required.
 Install CUDA from [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit-archive), PPL Quantization Tool will use CUDA compiler to compile cuda kernels at runtime.
 
-ATTENTION: For users of PyTorch, PyTorch might bring you a minimized CUDA libraries, which will not satisfy the requirement of this tool, you have to install CUDA from NVIDIA manually.
+ATTENTION: For users of pytorch, pytorch might bring you a minimized CUDA libraries, which will not satisfy the requirement of this tool, you have to install CUDA from NVIDIA manually.
 
-ATTENTION: Make sure your Python version is >= 3.6.0. PPL Quantization Tool is written with dialects that only supported by Python >= 3.6.0.
+ATTENTION: Make sure your python version is >= 3.6.0. PPL Quantization Tool is written with dialects that only supported by python >= 3.6.0.
+
+* Install PPQ from source:
+
+1. Run following code with your terminal(For windows user, use command line instead).
+
+```bash
+git clone https://github.com/openppl-public/ppq.git
+cd ppq
+python setup.py install
+```
+
+2. Wait for python finish its installation and pray for bug free.
+
+* Install PPQ from Pip:
+
+1. pre-built wheels are maintained in [PPQ](https://pypi.org/project/ppq/0.5.2/#files), you could simply install ppq with the following command
+
+```bash
+python3 -m pip install ppq
+```
 
 * Install dependencies:
     * For Linux User, use following command to install ninja:
@@ -46,30 +46,9 @@ ATTENTION: Make sure your Python version is >= 3.6.0. PPL Quantization Tool is w
 
     * For Windows User:
         * Download ninja.exe from [https://github.com/ninja-build/ninja/releases](https://github.com/ninja-build/ninja/releases), add it to Windows PATH Environment
-        * Download Visual Studio from [https://visualstudio.microsoft.com](https://visualstudio.microsoft.com/zh-hans/), if you already got a c++ compiler, you can skip this step. 
-        * Please Update Visual studio to 2019 or higher, otherwise there might be some compile error like: CxxFrameHandler4 unresolved, GSHandlerCheck unresolved.
-        * Add your c++ compiler to Windows PATH Environment, if you are using Visual Studio, it should be something like "C:\Program Files\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.16.27023\bin\Hostx86\x86"
-
-* Install PPQ from source:
-
-1. Run following code with your terminal(For windows user, use command line instead).
-
-```bash
-git clone https://github.com/openppl-public/ppq.git
-cd ppq
-pip install -r requirements.txt
-python setup.py install
-```
-
-2. Wait for Python finish its installation and pray for bug free.
-
-* Install PPQ from Pip:
-
-1. pre-built wheels are maintained in [PPQ](https://pypi.org/project/ppq/0.5.2/#files), you could simply install ppq with the following command(You should notice that install from pypi might get an outdated version ...)
-
-```bash
-python3 -m pip install ppq
-``` 
+        * Download Visual Studio from [https://visualstudio.microsoft.com](https://visualstudio.microsoft.com/zh-hans/), if you already got a c++ compiler, you can skip this step.
+        * Add your c++ compiler to Windows PATH Environment, if you are using Visual Studio, it should be something like "C:\Program Files\Microsoft Visual Studio\2017\Community\VC\Tools\MSVC\14.16.27023\bin\Hostx86\x86"
+    
 
 # Tutorials and Examples
 

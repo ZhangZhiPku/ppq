@@ -23,7 +23,7 @@ def minmax_to_scale_offset(
     min_val: float, max_val: float, 
     config: TensorQuantizationConfig,
     scale_threshold: float=OBSERVER_MIN_SCALE
-) -> Tuple[float, float]:
+) -> Tuple[float, int]:
     scale, offset = 1, 0
     if min_val > 0: min_val = 0
     if max_val < 0: max_val = 0
@@ -39,7 +39,7 @@ def minmax_to_scale_offset(
         scale = max(scale, scale_threshold)
         offset = 0
     else:
-        raise TypeError('Tensor Min Max Observer Excepts either ASYMMETRICAL or SYMMETRICAL quantization config.')
+        raise TypeError('Tensor Min Max Observer Except either ASYMMETRICAL or SYMMETRICAL quantization config.')
     if config.policy.has_property(QuantizationProperty.POWER_OF_2):
         scale = ppq_round_to_power_of_2(scale, policy=RoundingPolicy.ROUND_UP)
     return scale, offset
@@ -82,13 +82,11 @@ class TorchMinMaxObserver(BaseTensorObserver):
                 min_val = torch.min(torch.cat(self._min_val_collector, dim=0)).cpu().item(),
                 max_val = torch.max(torch.cat(self._max_val_collector, dim=0)).cpu().item(),
                 config=self._quant_cfg)
-            self._quant_cfg.scale  = torch.tensor([scale], dtype=torch.float32, device=device).squeeze(0)
-            self._quant_cfg.offset = torch.tensor([offset], dtype=torch.float32, device=device).squeeze(0)
+            self._quant_cfg.scale, self._quant_cfg.offset = scale, offset
             self._quant_cfg.state = QuantizationStates.ACTIVATED
-
         elif self._quant_cfg.policy.has_property(QuantizationProperty.PER_CHANNEL):
-            min_vals = torch.min(torch.cat(self._min_val_collector, dim=-1), dim=-1, keepdim=False)[0].cpu().numpy()
-            max_vals = torch.max(torch.cat(self._max_val_collector, dim=-1), dim=-1, keepdim=False)[0].cpu().numpy()
+            min_vals = torch.min(torch.cat(self._min_val_collector, dim=-1), dim=-1, keepdim=False)[0].cpu()
+            max_vals = torch.max(torch.cat(self._max_val_collector, dim=-1), dim=-1, keepdim=False)[0].cpu()
             assert(len(min_vals) == len(max_vals)), 'Min values and max values should at same length.'
             scales, offsets = [], []
             for min_val, max_val in zip(min_vals, max_vals):
@@ -97,10 +95,10 @@ class TorchMinMaxObserver(BaseTensorObserver):
                 scales.append(scale)
                 offsets.append(offset)
 
-            # scale, offset here only deployed on cpu
+            # scale, offset here only depolyed on cpu
             # we will move them towards target device through RunnableGraph
             self._quant_cfg.scale  = torch.tensor(scales, dtype=torch.float32, device=device)
-            self._quant_cfg.offset = torch.tensor(offsets, dtype=torch.float32, device=device)
+            self._quant_cfg.offset = torch.tensor(offsets, dtype=torch.int32, device=device)
             self._quant_cfg.state = QuantizationStates.ACTIVATED
         else:
             raise TypeError('Min-max Observer only work with per-tensor or per-channel quantize policy.')
@@ -122,8 +120,9 @@ class TorchHistObserver(TorchMinMaxObserver):
         elif self._phase == 'Collating Hist':
             if self._hist is None:
                 self._hist = torch.zeros(size=(self._hist_bins,), dtype=torch.int32, device=value.device)
-            if USING_CUDA_KERNEL and value.is_cuda: 
-                CUDA.Histogram_T(tensor=value, histogram=self._hist, scale=self._hist_scale)
+            if USING_CUDA_KERNEL: CUDA.Histogram(
+                tensor=value, histogram=self._hist, 
+                scale=self._hist_scale, offset=0, abs_mode=True)
             else: 
                 hist = torch.histc(torch.abs(value), self._hist_bins, min=0, max=self._hist_scale * self._hist_bins)
                 self._hist += hist.int()
@@ -213,6 +212,7 @@ class TorchHistObserver(TorchMinMaxObserver):
         return scale, offset
 
     def render_quantization_config(self):
+
         if not self._quant_cfg.policy.has_property(QuantizationProperty.SYMMETRICAL):
             ppq_warning('Applying hist observer with your tensor will make offset = 0'
                 '(However it is an ASYMMETRICAL quantized tensor)')
@@ -230,9 +230,7 @@ class TorchHistObserver(TorchMinMaxObserver):
             scale, offset = self.hist_to_scale_offset(
                 histogram=self._hist, hist_bins=self._hist_bins, 
                 hist_scale=self._hist_scale, config=self._quant_cfg)
-            device = self._hist.device
-            self._quant_cfg.scale  = torch.tensor([scale], dtype=torch.float32, device=device).squeeze(0)
-            self._quant_cfg.offset = torch.tensor([offset], dtype=torch.float32, device=device).squeeze(0)
+            self._quant_cfg.scale, self._quant_cfg.offset = scale, offset
             self._quant_cfg.state = QuantizationStates.ACTIVATED
 
 
@@ -251,10 +249,9 @@ class TorchPercentileObserver(BaseTensorObserver):
         if self._quant_cfg.state == QuantizationStates.INITIAL:
             if value.numel() >= pow(2, 24) and not USING_CUDA_KERNEL:
                 raise Exception('You got a tensor with more than 16777216 values, '
-                    'torch.quantile can not handle such many values. '
-                    'Use other observe algorithm instead.')
+                    'torch.quantile can not handle such many values.')
             if self._quant_cfg.policy.has_property(QuantizationProperty.PER_TENSOR):
-                if not USING_CUDA_KERNEL or (not value.is_cuda):
+                if not USING_CUDA_KERNEL:
                     min = -(-value).flatten().quantile(q=self._percentile).view(1, -1)
                     max = value.flatten().quantile(q=self._percentile).view(1, -1)
                     self._percentile_collector.append(torch.cat([max, min], dim=-1))
@@ -284,9 +281,7 @@ class TorchPercentileObserver(BaseTensorObserver):
                 min_val = self._percentile_collector[1].item(),
                 max_val = self._percentile_collector[0].item(),
                 config=self._quant_cfg)
-            
-            self._quant_cfg.scale  = torch.tensor([scale], dtype=torch.float32, device=device).squeeze(0)
-            self._quant_cfg.offset = torch.tensor([offset], dtype=torch.float32, device=device).squeeze(0)
+            self._quant_cfg.scale, self._quant_cfg.offset = scale, offset
             self._quant_cfg.state = QuantizationStates.ACTIVATED
         elif self._quant_cfg.policy.has_property(QuantizationProperty.PER_CHANNEL):
             raise PermissionError('Percentile observer can not deal with per channel quantization.')
