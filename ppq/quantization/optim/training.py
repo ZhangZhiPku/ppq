@@ -1,3 +1,4 @@
+import logging
 from typing import Callable, Dict, Iterable, List, Union
 
 import numpy as np
@@ -5,17 +6,19 @@ import torch
 from numpy import ceil
 from ppq.core import *
 from ppq.executor import BaseGraphExecutor, TorchExecutor
+from ppq.executor.base import GLOBAL_DISPATCHING_TABLE
 from ppq.IR import (BaseGraph, GraphCommandProcesser, Operation,
                     QuantableOperation)
-from ppq.log import NaiveLogger
+from ppq.IR.quantize import QuantableVariable
 from ppq.quantization.algorithm.training import *
 from ppq.quantization.measure import torch_mean_square_error, torch_snr_error
+from ppq.utils.round import ppq_tensor_round
 from torch.cuda import empty_cache
 from tqdm import tqdm
 
 from .base import QuantizationOptimizationPass
 
-logger = NaiveLogger.get_logger('PPQ')
+logger = logging.getLogger('PPQ')
 
 
 def has_bias(op: Operation):
@@ -23,124 +26,6 @@ def has_bias(op: Operation):
         return op.meta_data.num_of_input == 3
     else: return False
 
-
-def compute_loss(
-    output_names: List[str],
-    graph: BaseGraph,
-    dataloader: Iterable,
-    collate_fn: Callable,
-    executor: TorchExecutor,
-    loss_fn: Callable=torch_mean_square_error
-) -> Dict[str, float]:
-    """loss computing for fp32 and quantized graph outputs, used 
-    in multiple training-based algorithms below
-    Args:
-        output_names (List[str]): output variable names
-        graph (BaseGraph): ppq ir graph
-        dataloader (Iterable): calibration dataloader
-        collate_fn (Callable): batch collate func
-        executor (TorchExecutor): ppq torch executor
-        loss_fn (Callable, optional): loss computing func. Defaults to torch_mean_square_error.
-    Returns:
-        Dict[str, float]: loss dict for variables specified in `output_names`
-    """
-    losses = {name: 0.0 for name in output_names}
-    for idx,data in enumerate(dataloader):
-        if collate_fn is not None:
-            data = collate_fn(data)
-        dequantize_graph(graph)
-        fp_outputs = executor.forward(data, output_names)
-        restore_quantization_state(graph)
-        quant_outputs = executor.forward(data, output_names)
-        
-        for name, fp_output, quant_output in zip(output_names, fp_outputs, quant_outputs):
-            batch_loss = loss_fn(quant_output, fp_output)
-            losses[name] += batch_loss.detach().item()
-
-    for name in losses:
-        losses[name] /= (idx + 1)
-    return losses
-
-
-def dequantize_graph(graph: BaseGraph, exceptions: List[Operation]=[]) -> None:
-    for op in graph.operations.values():
-        if isinstance(op, QuantableOperation) and op not in exceptions:
-            op.dequantize(expire_device=None)
-
-
-def restore_quantization_state(graph: BaseGraph, exceptions: List[Operation]=[]) -> None:
-    for op in graph.operations.values():
-        if isinstance(op, QuantableOperation) and op not in exceptions:
-            op.restore_quantize_state(expire_device=None)
-
-
-def find_all_blocks(graph: BaseGraph,
-                executing_order: List[Operation],
-                block_limit: int=None
-    ) -> List[TrainableBlock]:
-    """block construction function of training-based algorithms, if `block_limit`
-    is not specified, block grandularity will be controlled by the default value
-    OPTIM_ADVOPT_GRAPH_MAXSIZE specified in ppq.core.common
-
-    Args:
-        graph (BaseGraph): ppq ir graph
-        executing_order (List[Operation]): topo search order
-        block_limit (int, optional): controls maximum depth of a block. Defaults to None.
-
-    Returns:
-        List[TrainableBlock]: list of all partitioned blocks
-    """
-    visited_ops = set()
-    blocks = []
-    block_builder = BlockBuilder(graph=graph, topo_order=executing_order)
-
-    for op in graph.operations.values():
-        # start from computing op
-        if op not in visited_ops and isinstance(op, QuantableOperation)\
-            and op.is_computing_op:
-            if block_limit is None:
-                block = block_builder.build(op, OPTIM_ADVOPT_GRAPH_MAXDEPTH)
-            else:
-                # use given limit
-                block = block_builder.build(op, block_limit)
-            # by default blocks are exclusive from each other
-            for op in block.rps:
-                visited_ops.add(op)
-            blocks.append(block)
-    return blocks
-
-def collect_block_input_output(
-    block: TrainableBlock,
-    executor: TorchExecutor,
-    dataloader: Iterable,
-    collate_fn: Callable,
-    collecting_device: str
-) -> List[Tuple[List[torch.Tensor], torch.Tensor]]:
-    """Collect training quant input and fp32 output values for block
-
-    Args:
-        block (TrainableBlock): the trainable block
-        executor (TorchExecutor): ppq graph executor
-        dataloader (Iterable): calibration dataloader
-        collate_fn (Callable): batch collate func
-        collecting_device (str): device to collect, cpu or cuda
-
-    Returns:
-        List[Tuple[List[torch.Tensor], torch.Tensor]]: collected block quant input and fp32 output tensors
-    """
-    block_input = []
-    for data in dataloader:
-        if collate_fn is not None:
-            data = collate_fn(data)
-        dequantize_graph(executor._graph)
-        fp_outputs = executor.forward(data, [var.name for var in block.ep.outputs])
-        restore_quantization_state(executor._graph)
-        quant_input = executor.forward(data, [block.sp.inputs[0].name])[0]
-        if collecting_device == 'cpu':
-            fp_outputs = [output.to(collecting_device) for output in fp_outputs]
-            quant_input = quant_input.to(collecting_device)
-        block_input.append((fp_outputs, quant_input))
-    return block_input
 
 class TrainingBasedPass(QuantizationOptimizationPass):
     """
@@ -258,7 +143,7 @@ class TrainingBasedPass(QuantizationOptimizationPass):
         # step - 3, comparing loss
         loss_now, loss_old = sum(losses), sum([ckpt.best_loss for ckpt in self._checkpoints.values()])
         loss_now, loss_old = loss_now / len(losses), loss_old / len(losses)
-        if self._verbose: print(f'NOISE-SIGNAL RATIO: {loss_old * 100 :.4f}% -> {loss_now * 100:.4f}%.')
+        if self._verbose: print(f'Power of Quant Noise: {loss_old * 100 :.4f}% -> {loss_now * 100:.4f}%.')
 
         # if there is a loss drop, update all losses.
         if loss_old > (loss_now * CHECKPOINT_TOLERANCE):
@@ -557,437 +442,765 @@ class AdaRoundPass(QuantizationOptimizationPass):
 
 
 class BlockwiseReconstructionPass(TrainingBasedPass):
-    """Blockwise Reconstruction Pass, blockwisely perform adaround, if you specify interested_layers in the setting, 
-    then only block which containes any of operations specified in interested_layers will be optimized, otherwise all
-    searched blocks will be optimized.
-       A standard procedure is, first turn all training-based optimization passes off in your quantization setting and
-    run a plain quantization, then use error analysis tool(provided by ppq) to analysis snr error or cosine similarities
-    of every layer, choose names of those with significant snr or poor similarities as your interested_layers, then turn
-    on this pass and do optimization. In case you have no idea which layers should be selected as interested_layers, simply
-    leave it as blank and all blocks will be tuned.
-       Note that you could control the maximum number of operations in a block by setting OPTIM_ADVOPT_GRAPH_MAXSIZE in
-    ppq.core.common, and by default every block will be trained for 300 epochs, which takes certain long time. The optimization
-    goal of every block is
-                Loss = LpNormLoss(y, y^) + lamda * rounding_loss(v)
-    where y is the output of the current block running in fp32 mode, and y^ is the output of the current block running
+    """Blockwise Reconstruction Pass, blockwisely perform adaround, only linear blocks are supported for now,
+    if you specify interested_layers in the setting, then only block which containes any of operations specified
+    in interested_layers will be optimized, otherwise all searched blocks will be optimized. A standard procedure
+    is, first turn all training-based optimization passes off in your setting and run a plain quantization, then
+    use error analysis tool(provided by ppq) to analysis snr error or cosine similarities of every layer, choose 
+    names of those with significant snr or poor similarities as your interested_layers, then turn on this pass and
+    do optimization.
+
+       Note that you could control the maximum number of operations in a block by setting max_block_size, and by
+    default every block will be trained for 300 epochs, the optimization goal is
+
+                Loss = MSELoss(y, y^) + lamda * rounding_loss(v)
+
+    where y is the output of the current block running in fp mode, and y^ is the output of the current block running
     in quant mode, lamda is a hyperparameter adjusting scales of rounding loss, and v is the element-wise rounding
-    parameter applied to weights of every computing op in the block.
+    parameter applied to weights of every computing op in the block
     """
     def __init__(self,
-                name: str = 'Block-wise Reconstruction',
+                name: str = 'block-wise reconstruction',
                 interested_layers: List[str] = [],
                 tune_act_scale: bool = True,
+                max_block_size: int = 4,
                 epochs: int = 300,
                 lr: float = 1e-3,
                 lamda: float = 1.0,
-                scale_multiplier: float = 2.0,
-                collecting_device: str ='cuda'
+                scale_multiplier: float = 2.0
     ) -> None:
         super().__init__(name = name)
         self.interested_layers = interested_layers
-        self.tune_act_scale    = tune_act_scale
-        self.epochs            = epochs
-        self.lr                = lr
-        self.lamda             = lamda
-        self.scale_multuplier  = scale_multiplier
-        self.collecting_device = collecting_device
+        self.tune_act_scale = tune_act_scale
+        self.max_block_size = max_block_size
+        self.epochs = epochs
+        self.lr = lr
+        self.lamda = lamda
+        self.scale_multuplier = scale_multiplier
+
+    def find_all_blocks(self, graph: BaseGraph) -> List[List[Operation]]:
+        # find linear block which contains single-input-output ops, i.e.
+        # receiving only one non-parameter variable as first input and
+        # producing only one output
+
+        visited_ops = set()
+        blocks = []
+        for op in graph.operations.values():
+            if isinstance(op, QuantableOperation) and op.is_computing_op\
+                and op not in visited_ops:
+                block = [op]
+                next_ops = graph.get_downstream_operations(op)
+                while len(next_ops) == 1 and isinstance(next_ops[0], QuantableOperation)\
+                    and next_ops[0].num_of_input - next_ops[0].num_of_parameters == 1 and\
+                    not next_ops[0].inputs[0].is_parameter:
+                    block.extend(next_ops)
+                    if len(block) >= self.max_block_size:
+                        break
+                    next_ops = graph.get_downstream_operations(next_ops[0])
+                for op in block:
+                    visited_ops.add(op)
+                blocks.append(block)
+        return blocks
+
+    
+    def enable_block_grad(self, block: List[Operation]) -> None:
+        for op in block:
+            for var in op.parameters:
+                var.value.requires_grad = True
+
+    def disable_block_grad(self, block: List[Operation]) -> None:
+        for op in block:
+            for var in op.parameters:
+                var.value.requires_grad = False
 
 
     def initiate_block_params(self,
-                            block: TrainableBlock,
+                            block: List[Operation],
                             reg: AdaroundRegTerm,
                             device: Union[str, torch.device]
-    ) -> Dict[TensorQuantizationConfig, BlockwiseReconstructionDelegator]:
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
         params = {}
-        for op in block.rps:
-            if isinstance(op, QuantableOperation):
-                for (cfg, var) in op.config_with_variable:
-                    if (not self.tune_act_scale and not var.is_parameter) or cfg in params:
-                        continue
-                    masters = []
-                    scale_multiplier = 1.0
-                    if cfg.state == QuantizationStates.PASSIVE:
-                        # bias
-                        if op.is_computing_op:
-                            scale_multiplier = self.scale_multuplier
-                            for cfg_ in op.config.input_quantization_config[:2]:
-                                if cfg_.dominated_by in params:
-                                    masters.append(params[cfg_.dominated_by])
-                                else:
-                                    scale_multiplier *= convert_any_to_torch_tensor(cfg_.scale,\
-                                                device=device, dtype=torch.float32)
-
-                            delegator = BlockwiseReconstructionDelegator(var, cfg, reg, scale_multiplier, device)
-                            delegator.masters = masters
-                            params[cfg] = delegator
-                    
-                    # for those vars who controls their own scales and offsets
-                    elif cfg.state == QuantizationStates.ACTIVATED:
-                        delegator = BlockwiseReconstructionDelegator(var, cfg, reg, scale_multiplier, device)
-                        params[cfg] = delegator
-                    elif cfg.state == QuantizationStates.SLAVE and cfg.dominated_by == cfg:
-                        delegator = BlockwiseReconstructionDelegator(var, cfg, reg, scale_multiplier, device)
-                        params[cfg] = delegator
-                        for op_ in block.rps:
-                            if isinstance(op_, QuantableOperation):
-                                for (cfg_, var_) in op_.config_with_variable:
-                                    if cfg_.state == QuantizationStates.SLAVE and cfg_.dominated_by == cfg:
-                                        delegator_ = BlockwiseReconstructionDelegator(var_, cfg_, reg, scale_multiplier, device)
-                                        delegator_.masters = [delegator]
-                                        params[cfg_] = delegator_
+        for idx, op in enumerate(block):
+            # tune roundings for weight of computing ops
+            if op.is_computing_op:
+                weight, cfg = op.inputs[1].value, op.config.input_quantization_config[1]
+                scale = convert_any_to_torch_tensor(cfg.scale, device=device, dtype=torch.float32)
+                if cfg.policy.has_property(QuantizationProperty.PER_CHANNEL):
+                    shape = [1 if axis != cfg.channel_axis else -1 for axis in range(weight.ndim)]
+                    scale = scale.view(shape)
+                round_diff = (weight / scale) - (weight / scale).floor()
+                v_init = -torch.log((reg.zeta - reg.gamma) / (round_diff - reg.gamma) - 1)
+                continuous_v = torch.nn.Parameter(v_init.to(device), True)
+                params[op.inputs[1].name] = {'rounding' : continuous_v}
+            
+            # tune scale and offset for input
+            cfg = op.config.input_quantization_config[0]
+            if self.tune_act_scale and QuantizationStates.is_activated(cfg.state) and cfg.dominated_by == cfg:
+                scale = convert_any_to_torch_tensor(cfg.scale, device=device, dtype=torch.float32)
+                scale = torch.nn.Parameter(scale, requires_grad=True)
+                offset = convert_any_to_torch_tensor(cfg.offset, device=device, dtype=torch.float32)
+                bias = offset * scale.detach()
+                if cfg.policy.has_property(QuantizationProperty.ASYMMETRICAL):
+                    bias = torch.nn.Parameter(bias, requires_grad=True)
+                params[op.inputs[0].name + f'_{op.name}'] = {'scale': scale, 'bias': bias}
+            
+            # tune scale and offset for output
+            cfg = op.config.output_quantization_config[0]
+            if self.tune_act_scale and QuantizationStates.is_activated(cfg.state) and cfg.dominated_by == cfg:
+                scale = convert_any_to_torch_tensor(cfg.scale, device=device, dtype=torch.float32)
+                scale = torch.nn.Parameter(scale, requires_grad=True)
+                offset = convert_any_to_torch_tensor(cfg.offset, device=device, dtype=torch.float32)
+                bias = offset * scale.detach()
+                if cfg.policy.has_property(QuantizationProperty.ASYMMETRICAL):
+                    bias = torch.nn.Parameter(bias, requires_grad=True)
+                params[op.outputs[0].name + f'_{op.name}'] = {'scale': scale, 'bias': bias}
 
         return params
 
 
+    def quantize_var(self,
+                    tensor: torch.Tensor,
+                    var: QuantableVariable,
+                    op: QuantableOperation,
+                    cfg: TensorQuantizationConfig,
+                    all_params: Dict[str, Dict[str, torch.Tensor]],
+                    reg: AdaroundRegTerm,
+                    executor: BaseGraphExecutor
+    ) -> torch.Tensor:
+
+        # quantize weight
+        if var.name in all_params:
+            scale = cfg.scale
+            offset = cfg.offset
+            if cfg.policy.has_property(QuantizationProperty.PER_CHANNEL):
+                shape = [1 if axis != cfg.channel_axis else -1 for axis in range(tensor.ndim)]
+                scale = scale.view(shape)
+                offset = offset.view(shape)
+            tensor = (tensor / scale).floor() + reg.rectified_sigmoid(all_params[var.name]['rounding'])
+            tensor = torch.clamp(tensor + offset, cfg.quant_min, cfg.quant_max)
+            tensor = (tensor - offset) * scale
+
+        # quantize activated activation
+        elif self.tune_act_scale and var.name + f'_{op.name}' in all_params:
+            scale = all_params[var.name + f'_{op.name}']['scale']
+            bias = all_params[var.name + f'_{op.name}']['bias']
+            if cfg.policy.has_property(QuantizationProperty.PER_CHANNEL):
+                shape = [1 if axis != cfg.channel_axis else -1 for axis in range(tensor.ndim)]
+                scale = scale.view(shape)
+                bias = bias.view(shape)
+            scale = scale.abs()
+            tensor = (tensor + bias) / scale
+            tensor_round = ppq_tensor_round(tensor, cfg.rounding)
+            tensor_round = (tensor_round - tensor).detach() + tensor
+            tensor_round = torch.clamp(tensor_round, cfg.quant_min, cfg.quant_max)
+            tensor = tensor_round * scale - bias
+
+        # for anything else which doesn't require gradient
+        else:
+            tensor = executor._quant_function(tensor, cfg)
+        
+        return tensor
+
+
+    def execute_block(self,
+                    inputs: List[torch.Tensor],
+                    block: List[Operation],
+                    all_params: Dict[str, Dict[str, torch.Tensor]],
+                    reg: AdaroundRegTerm,
+                    executor: BaseGraphExecutor
+    ) -> List[torch.Tensor]:
+        # execute linear block, every op in the block is assumed to have only one non-param input
+        # and one output
+        for op in block:
+            assert(all([var.is_parameter for var in op.inputs[1:]]))
+            inputs = inputs + [var.value for var in op.inputs[1:]]
+            if isinstance(op, QuantableOperation):
+                input_configs = [_ for _ in op.config.input_quantization_config]
+                inputs = [self.quantize_var(tensor, var, op, cfg, all_params, reg, executor) for\
+                    tensor, var, cfg in zip(inputs, op.inputs, input_configs)]
+            outputs = executor.operation_forward(op, inputs, False, False)
+            if isinstance(op, QuantableOperation):
+                output_configs = [_ for _ in op.config.output_quantization_config]
+                outputs = [self.quantize_var(tensor, var, op, cfg, all_params, reg, executor) for\
+                    tensor, var, cfg in zip(outputs, op.outputs, output_configs)]
+            inputs = outputs
+        return outputs
+
+    def dequantize_graph(self, graph: BaseGraph, exceptions: List[Operation]=[]) -> None:
+       for op in graph.operations.values():
+           if isinstance(op, QuantableOperation) and op not in exceptions:
+               op.dequantize(expire_device=None)
+   
+    def restore_quantization_state(self, graph: BaseGraph, exceptions: List[Operation]=[]) -> None:
+        for op in graph.operations.values():
+            if isinstance(op, QuantableOperation) and op not in exceptions:
+                op.restore_quantize_state(expire_device=None)
+    
+
+    def assign(self, 
+            block: List[QuantableOperation],
+            all_params: Dict[str, Dict[str, torch.Tensor]]
+    ) -> None:
+        for op in block:
+            if isinstance(op, QuantableOperation):
+                for cfg, var in op.config_with_variable:
+                    # update weight
+                    if var.name in all_params:
+                        rounding = all_params[var.name]['rounding']
+                        weight = var.value
+                        scale = cfg.scale
+                        offset = cfg.offset
+                        if cfg.policy.has_property(QuantizationProperty.PER_CHANNEL):
+                            shape = [1 if axis != cfg.channel_axis else -1 for axis in range(weight.ndim)]
+                            scale = scale.view(shape)
+                            offset = offset.view(shape)
+                        weight = (weight / scale).floor() +  AdaroundRegTerm().rectified_sigmoid(rounding)
+                        weight = torch.clamp(weight, cfg.quant_min, cfg.quant_max)
+                        weight = (weight - offset) * scale
+                        var.value = weight
+                    # activation scale, offset
+                    elif var.name + f'_{op.name}' in all_params:
+                        cfg.scale = all_params[var.name + f'_{op.name}']['scale'].data.abs()
+                        cfg.offset = (all_params[var.name + \
+                            f'_{op.name}']['bias'].data / cfg.scale).type(torch.int32)
+
+    def compute_original_loss(self,
+                            output_names: List[str],
+                            graph: BaseGraph,
+                            dataloader: Iterable,
+                            collate_fn: Callable,
+                            executor: BaseGraphExecutor
+    ) -> float:
+        loss = 0.0
+        for idx,data in tqdm(enumerate(dataloader), total=len(dataloader), desc='Computing Original Loss'):
+            if collate_fn is not None:
+                data = collate_fn(data)
+            self.dequantize_graph(graph)
+            fp_outputs = executor.forward(data, output_names)[0]
+            self.restore_quantization_state(graph)
+            quant_outputs = executor.forward(data, output_names)[0]
+            batch_loss = torch_mean_square_error(quant_outputs, fp_outputs)
+            loss += batch_loss.detach().item()
+        return loss / (idx + 1)
+
     def tune_block_weight_scale(self,
-                            block: TrainableBlock,
+                            block: List[QuantableOperation],
                             device: Union[str, torch.device],
-                            epochs: int=900
+                            epochs: int=30
     ) -> None:
         # before we tune weight roundings and activation scales, we optimize weight scale by
-        # minimizing MSE(W, W^), 900 epochs would be enough in this non-overfit setting. Note
-        # that this is usually unnecessary in 8 bit quantization, but we do it it anyway and
-        # the loss checking procedure makes sure we always obtain no worse results.
-        for op in block.rps:
-            if op.is_computing_op and isinstance(op, QuantableOperation):
-                logger.info(f'Tune weight scale for {op.name} ...')
+        # minimizing MSE(W, W^)
+        for op in block:
+            if op.is_computing_op:
                 cfg = op.config.input_quantization_config[1]
-                weight = op.inputs[1].value
-                if cfg.policy.has_property(QuantizationProperty.POWER_OF_2):
-                    logger.warning(f'{op.name} has a power-of-2 policy, scale tuning is forbidden')
-                    continue
-                assert cfg.state == QuantizationStates.ACTIVATED, 'the config of weight param\
-                should be ACTIVATED for tuning'
-                delegator = StraightThroughEstimateDelegator(cfg, True, 1.0, device)
-                params = delegator.collect_params()
+                scale = convert_any_to_torch_tensor(cfg.scale, dtype=torch.float32, device=device)
+                scale = torch.nn.Parameter(scale, requires_grad=True)
+                params = [scale]
+                offset = convert_any_to_torch_tensor(cfg.offset, device=device, dtype=torch.float32)
+                bias = offset * scale.detach()
+                if cfg.policy.has_property(QuantizationProperty.ASYMMETRICAL):
+                    bias = torch.nn.Parameter(bias, requires_grad=True)
+                    params.append(bias)
+                weight = op.parameters[0].value
+                grad_scale = 1.0 / (weight.numel() * cfg.quant_max)**0.5
                 optimizer = torch.optim.Adam(params, lr=1e-3)
-                scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [int(epochs / 2), int(epochs * 2 / 3)])
                 initial_loss, final_loss = None, None
-                for _ in range(epochs):
-                    loss = torch_mean_square_error(delegator(weight, cfg), weight, reduction='sum')
+                for _ in tqdm(range(epochs), total=epochs, desc=f'tune weight scale for {op.name}'):
+                    scale_ = (scale - scale * grad_scale).detach() + scale * grad_scale
+                    bias_  = bias
+                    if cfg.policy.has_property(QuantizationProperty.PER_CHANNEL):
+                        shape = [1 if axis != cfg.channel_axis else -1 for axis in range(weight.ndim)]
+                        scale_ = scale_.view(shape)
+                        bias_ = bias_.view(shape)
+                    scale_ = scale_.abs()
+                    weight_quant = (weight + bias_) / scale_
+                    weight_quant_round = ppq_tensor_round(weight_quant, cfg.rounding)
+                    weight_quant_round = (weight_quant_round - weight_quant).detach() + weight_quant
+                    weight_quant_round = torch.clamp(weight_quant_round, cfg.quant_min, cfg.quant_max)
+                    weight_dequant = weight_quant_round * scale_ - bias_
+                    loss = torch_mean_square_error(weight_dequant, weight, reduction='sum')
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
                     if initial_loss is None:
                         initial_loss = loss.detach().item()
                     final_loss = loss.detach().item()
-                    scheduler.step()
+                logger.info(f'Optimize {op.name} weight scale, initial loss {initial_loss}, optimized loss {final_loss}')
                 if final_loss < initial_loss:
-                    delegator.finalize()
+                    cfg.scale = scale.data.abs()
+                    cfg.offset = (bias.data / cfg.scale).type(torch.int32)
+                    if len(op.inputs) > 2:
+                        [cfg_X, cfg_W, cfg_b] = op.config.input_quantization_config
+                        cfg_b.scale = self.scale_multuplier * cfg_X.scale * cfg_W.scale
+                else:
+                    logger.info('Loss increased, abandon trained values...')
+
 
     def optimize(self,
                 processer: GraphCommandProcesser,
                 dataloader: Iterable,
-                executor: TorchExecutor,
+                executor: BaseGraphExecutor,
                 collate_fn: Callable,
                 **kwargs
     ) -> None:
         graph = processer.graph
-        all_blocks = find_all_blocks(graph, executor._executing_order)
-        for blk_idx, block in enumerate(all_blocks):
-            block_dataloader = collect_block_input_output(block, executor, dataloader, collate_fn, self.collecting_device)
+        all_blocks = self.find_all_blocks(graph)
+        for block in all_blocks:
             # if interested_layers are not empty, we only optimize block which contains
             # desired ops specified in interested_layers
-            if len(self.interested_layers) > 0 and all([op.name not in self.interested_layers for op in block.rps]):
+            if len(self.interested_layers) > 0 and all([op.name not in self.interested_layers for op in block]):
                 continue
-
-            logger.info(f'Optimize block {blk_idx + 1}/{len(all_blocks)} : {block.sp.name} -> ... -> {block.ep.name}, '
-                        f'{len(block.rps)} ops in total')
             # tune weight scale first
-            output_names = [var.name for var in block.ep.outputs]
-
             self.tune_block_weight_scale(block, executor._device)
-
             # compute original loss for loss checking
-            logger.info('Computing Original Loss ...')
-            original_loss = compute_loss(output_names, graph, \
-                dataloader, collate_fn, executor, loss_fn=Lp_norm)
-            original_loss = sum(list(original_loss.values()))
-
+            original_loss = self.compute_original_loss([block[-1].outputs[0].name], graph, dataloader, collate_fn, executor)
             # rounding loss intialization
             reg = AdaroundRegTerm(max_iter=len(dataloader) * self.epochs)
             all_params = self.initiate_block_params(block, reg, executor._device)
-            scale_params, continue_vs = [], []
+            self.enable_block_grad(block)
+            param_need_grad, continue_vs = [], []
             
             # collect rounding parameters for rounding loss computing,
             # and all gradient-needed parameters for optimization
-            for (cfg, delegator) in all_params.items():
-                if delegator.rounding is not None:
-                    continue_vs.append(delegator.rounding)
-                if self.tune_act_scale and not delegator.is_parameter:
-                    scale_params.extend(delegator.collect_params())
-                executor.register_quantize_delegate(cfg, delegator)
+            for var_name in all_params:
+                for item in all_params[var_name]:
+                    if item == 'rounding':
+                        continue_vs.append(all_params[var_name][item])
+                    if all_params[var_name][item].requires_grad:
+                        param_need_grad.append(all_params[var_name][item])
+            
+            # Adam optimizer with a two-step scheduler
+            optimizer = torch.optim.Adam(param_need_grad, lr=self.lr)
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [int(self.epochs / 2), int(self.epochs * 2 / 3)])
 
-            optimizers, schedulers = [torch.optim.Adam(continue_vs, lr=self.lr)], []
-            if self.tune_act_scale and len(scale_params) > 0:
-                # refer to implementation details in brecq paper
-                scale_optimizer = torch.optim.Adam(scale_params, lr=4e-5)
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(scale_optimizer, \
-                    T_max=len(dataloader) * self.epochs, eta_min=0.)
-                optimizers.append(scale_optimizer)
-                schedulers.append(scheduler)
-
+            logger.info('Optimize block ' + '->'.join([op.name for op in block]))
             cur_iter = 0
-            for epoch in tqdm(range(self.epochs), desc=f'Optimize block {blk_idx + 1}/{len(all_blocks)}', total=self.epochs):
-                epoch_rounding_loss = 0.0
-                epoch_reconstruction_loss = {name: 0.0 for name in output_names}
-                for idx, data in enumerate(block_dataloader):
-                    fp_outputs, quant_input = data
-                    if str(executor._device) != self.collecting_device:
-                        quant_input = quant_input.to(executor._device)
-                        fp_outputs  = [output.to(executor._device) for output in fp_outputs]
-
-                    quant_outputs = executor.partial_graph_forward(block.rps, \
-                        {block.sp.inputs[0].name: quant_input}, output_names)
-
-                    reconstruction_loss = 0.0
-                    for (name, fp_output, quant_output) in zip(output_names, fp_outputs, quant_outputs):
-                        loss = Lp_norm(fp_output, quant_output)
-                        reconstruction_loss += loss
-                        epoch_reconstruction_loss[name] += loss.detach().item()
+            for epoch in range(self.epochs):
+                epoch_mse_loss, epoch_rounding_loss = 0.0, 0.0
+                for idx, data in tqdm(enumerate(dataloader), total=len(dataloader), desc=f'Epoch {epoch + 1}/{self.epochs}'):
+                    if collate_fn is not None:
+                        data = collate_fn(data)
+                    self.dequantize_graph(graph)
+                    fp_outputs = executor.forward(data, [block[-1].outputs[0].name])
+                    self.restore_quantization_state(graph)
+                    quant_inputs = executor.forward(data, [block[0].inputs[0].name])
+                    quant_outputs = self.execute_block(quant_inputs, block, all_params, reg, executor)
+                    mse_loss = torch_mean_square_error(fp_outputs[0], quant_outputs[0])
                     rounding_loss = torch.tensor(0.0, dtype=torch.float32, device=executor._device)
                     for continue_v in continue_vs:
-                        rounding_loss = rounding_loss + reg(continue_v, cur_iter)
+                        rounding_loss = rounding_loss + reg(continue_v, cur_iter, reduction='mean')
                     rounding_loss = self.lamda * rounding_loss
-                    total_loss = reconstruction_loss + rounding_loss
-                    for optimizer in optimizers:
-                        optimizer.zero_grad()
-                    total_loss.backward()
-                    for optimizer in optimizers:
-                        optimizer.step()
+                    loss = mse_loss + rounding_loss
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    epoch_mse_loss += mse_loss.detach().item()
                     epoch_rounding_loss += rounding_loss.detach().item()
                     cur_iter += 1
-
-                for scheduler in schedulers:
-                    scheduler.step()
-
-                for name in epoch_reconstruction_loss:
-                    logger.debug(f'Epoch {epoch + 1} || output variable {name} || reconstruction loss = '
-                                f'{epoch_reconstruction_loss[name] / (idx + 1) :.5f}')
-
-                avg_recon_loss = sum(list(epoch_reconstruction_loss.values())) / (idx + 1)
+                avg_mse_loss = epoch_mse_loss / (idx + 1)
                 avg_rounding_loss = epoch_rounding_loss / (idx + 1)
-                logger.debug(f'Epoch {epoch + 1} || reconstruction loss {avg_recon_loss :.5f}'
-                            f' || rounding loss {avg_rounding_loss :.5f}')
+                logger.info(f'Epoch {epoch} || mse loss {avg_mse_loss} || rounding loss {avg_rounding_loss}')
+                scheduler.step()
 
-                early_stop_flag = 1
-                for _,continue_v in enumerate(continue_vs):
-                    h_v = continue_v.detach()
-                    logger.debug("Rounding var {} Ceil: {:>5} Floor: {:>5} Total: {:>5} Ratio: {:>.3f}".format(
-                        _ + 1, h_v[h_v + 1e-4 >= 1.0].numel(), h_v[h_v <= 1e-4].numel(), torch.numel(h_v),
-                        (h_v[h_v + 1e-4 >= 1.0].numel() + h_v[h_v <= 1e-4].numel()) / torch.numel(h_v))
-                    )
-                    early_stop_flag &= ((h_v[h_v + 1e-4 >= 1.0].numel() + h_v[h_v <= 1e-4].numel()) / torch.numel(h_v) > 0.9999)
-                
-                if early_stop_flag:
-                    break
-            
-            if  early_stop_flag:
-                logger.info('Already converged, stop training...')
-
-            logger.info(f'Original Reconstruction Loss {original_loss} || Optimized Reconstruction loss {avg_recon_loss}')
-            if avg_recon_loss < original_loss:
-                for (cfg, delegator) in all_params.items():
-                    delegator.finalize()
+            self.disable_block_grad(block)
+            logger.info(f'Original Loss {original_loss} || Optimized loss {avg_mse_loss}')
+            if avg_mse_loss < original_loss:
+                self.assign(block, all_params)
             else:
-                logger.warning('Loss increased, abandon trained values...')
-
-            for (cfg, delegator) in all_params.items():
-                executor.remove_quantize_delegate(cfg)
-            
-            # process passive parameter of Pad or Clip for coherence
-            for op in block.rps:
-                if isinstance(op, QuantableOperation) and op.type == 'Clip':
-                    input_config = op.config.input_quantization_config[0].dominated_by
-                    for config in op.config.input_quantization_config[1: ]:
-                        config.scale  = input_config.scale
-                        config.offset = input_config.offset
-                elif isinstance(op, QuantableOperation) and op.type == 'Pad':
-                    if op.num_of_input != 3: continue
-                    input_config = op.config.input_quantization_config[0].dominated_by
-                    pad_config = op.config.input_quantization_config[-1]
-                    pad_config.scale  = input_config.scale
-                    pad_config.offset = input_config.offset
+                logger.info('Loss increased, abandon trained values...')
 
 
 class LearningStepSizeOptimization(TrainingBasedPass):
-    """Learned Step Size optimization, a training-based optimization pass which tunes weight, weight scale, weight offset
-    (for aym quantization only) and activation scale, activation offset(for asym quantization only) of computing layers. 
-    
-        This pass will firstly partition the graph into multiple trainable blocks, and you can control partition grandularity
-    by setting the global parameter OPTIM_ADVOPT_GRAPH_MAXSIZE in ppq.core.common, usually a block contains several computing
-    operations(Conv, Gemm or ConvTranspose).
-            
-        OPTIM_ADVOPT_GRAPH_MAXSIZE = 1                     OPTIM_ADVOPT_GRAPH_MAXSIZE = 3
-             
-              __|________                                        __|_________
-               Conv    |                                          Conv     |
-                |     block-1                                      |       |
-              _Relu____|_                                         Relu     |
-              __|________                                          |      block-1
-               Conv    |                                          Conv     |
-                |     block-2                                      |       |
-              _Relu____|_                                        _Relu_____|_
-                |                                                  |
-        
-        If `interested_layers` parameter is specified, then only blocks which contains operations specified in `interested_layers`
-    will be tuned, otherwise all partitioned blocks will be tuned by default.
-        
-        For more information about step learning algorithm, please refer to
-            Esser, Steven K., et al. "Learned step size quantization." arXiv preprint arXiv:1902.08153 (2019).
+    """Learned Step Size optimization, a training-based optimization pass which tunes weight, weight scale, weight offset(aym quantization)
+    and activation scale, activation offset(asym quantization) of computing layers. You can perform a graphwise optimization which optimizes
+    parameters all together by setting mode to graphwise, or layerwise optimization which optimizes in local range(layer by layer) by setting
+    mode to layerwise. Similar to block-wise reconstruction pass, interested_layers contains computing layers which suffers from large precision
+    loss introduced by quantization, and if it's not specified, this pass will try to tune all condition-satisfied comptuing layers.
+
+       In graphwise mode, if the output_names is not specified, then every graph output will be used to compute final loss, note that in some
+    cases gradient can't flow back from graph outputs all the way back to every computing ops, then you should specify output_names by choosing
+    variables which guarantee valid gradient backward to every computing op specified in the interested_layers.
+
     """
     def __init__(self,
                 name: str = 'PPQ LSQ Optimization',
                 interested_layers: List[str] = [],
+                output_names: List[str] = [],
                 epochs: int = 30,
-                lr: float = 5e-5,
-                scale_multiplier: float = 2.0,
-                collecting_device: str = 'cuda'
+                lr: float = 1e-4,
+                scale_multiplier: float = 2,
+                mode: str = 'graphwise'
     ) -> None:
         super().__init__(name=name)
         self.interested_layers = interested_layers
+        self.output_names = output_names
         self.epochs = epochs
         self.lr = lr
         self.scale_multiplier = scale_multiplier
-        self.collecting_device = collecting_device
-    
-    def initiate_param(self,
-                    block: TrainableBlock,
-                    device: Union[str, torch.device]
-    ) -> Dict[TensorQuantizationConfig, StraightThroughEstimateDelegator]:
+        self.mode = mode
+
+    def initiate_param(self, ops: List[Operation], device: Union[str, torch.device]) -> Dict[str, Dict[str, torch.Tensor]]:
         params = {}
-        for op in block.rps:
-            if isinstance(op, QuantableOperation):
-                for (cfg, var) in op.config_with_variable:
-                    scale_multiplier = 1.0
-                    masters = []
-                    if cfg.policy.has_property(QuantizationProperty.POWER_OF_2):
-                        logger.warning(f'{op.name} has a power-of-2 policy, scale tuning is forbidden')
-                        continue
-                    if cfg.state == QuantizationStates.PASSIVE and op.is_computing_op:
-                        scale_multiplier = self.scale_multiplier
-                        for cfg_ in op.config.input_quantization_config[:2]:
-                            if cfg_.dominated_by in params:
-                                masters.append(params[cfg_.dominated_by])
-                            else:
-                                scale_multiplier *=  convert_any_to_torch_tensor(cfg_.scale,\
-                                                device=device, dtype=torch.float32)
-                        delegator = StraightThroughEstimateDelegator(cfg, var.is_parameter, scale_multiplier, device)
-                        delegator.masters = masters
-                        params[cfg] = delegator
-
-                    elif cfg.state == QuantizationStates.ACTIVATED:
-                        delegator = StraightThroughEstimateDelegator(cfg, var.is_parameter, scale_multiplier, device)
-                        params[cfg] = delegator
-                    elif cfg.state == QuantizationStates.SLAVE and cfg.dominated_by == cfg:
-                        delegator = StraightThroughEstimateDelegator(cfg, var.is_parameter, scale_multiplier, device)
-                        params[cfg] = delegator
-                        for op_ in block.rps:
-                            if isinstance(op_, QuantableOperation):
-                                for (cfg_, var_) in op_.config_with_variable:
-                                    if cfg_.state == QuantizationStates.SLAVE and cfg_.dominated_by == cfg:
-                                        delegator_ = StraightThroughEstimateDelegator(cfg_, var_.is_parameter, scale_multiplier, device)
-                                        delegator_.masters = [delegator]
-                                        params[cfg_] = delegator_
-
+        for idx, (var, cfg) in enumerate(zip(ops[0].inputs[1:2] + ops[-1].outputs[0:1], \
+            ops[0].config.input_quantization_config[1:2] + ops[-1].config.output_quantization_config[0:1])):
+            scale = convert_any_to_torch_tensor(cfg.scale, device=device, dtype=torch.float32)
+            scale = torch.nn.Parameter(scale, requires_grad=True)
+            offset = convert_any_to_torch_tensor(cfg.offset, device=device, dtype=torch.float32)
+            bias = offset * scale.detach()
+            if cfg.policy.has_property(QuantizationProperty.ASYMMETRICAL):
+                bias = torch.nn.Parameter(bias, requires_grad=True)
+            params[var.name] = {'scale': scale, 'bias': bias}
         return params
-
-    def enable_grad(self, block: TrainableBlock) -> None:
-        for op in block.rps:
-            if isinstance(op, QuantableOperation) and op.is_computing_op:
-                for var in op.inputs[1:]:
-                    var.value.requires_grad = True
     
-    def disable_grad(self, block: TrainableBlock) -> None:
-        for op in block.rps:
-            if isinstance(op, QuantableOperation) and op.is_computing_op:
-                for var in op.inputs[1:]:
-                    var.value.requires_grad = False
+    def enable_grad(self, ops: List[Operation]) -> None:
+        for var in ops[0].inputs[1:]:
+            var.value.requires_grad = True
+    
+    def disable_grad(self, ops: List[Operation]) -> None:
+        for var in ops[0].inputs[1:]:
+            var.value.requires_grad = False
 
-    def recover(self, block: TrainableBlock) -> None:
-        for op in block.rps:
-            if isinstance(op, QuantableOperation):
-                op.dequantize()
-                op.store_parameter_value()
-                op.restore_quantize_state()
-
-    def LSQ_optimize(self,
-                blocks: List[TrainableBlock],
-                graph: BaseGraph,
-                dataloader: Iterable,
-                collate_fn: Callable,
-                executor: TorchExecutor
-    ) -> None:
-        for blk_idx, blk in enumerate(blocks):
-            block_dataloader = collect_block_input_output(blk, executor, dataloader, collate_fn, self.collecting_device)
-            output_names = [var.name for var in blk.ep.outputs]
-            logger.info(f'Optimizing block {blk.sp.name} --> ... --> {blk.ep.name}, total {len(blk.rps)} ops')
-            logger.info('Computing Original Loss ...')
-            original_loss = compute_loss(output_names, graph, dataloader, collate_fn, executor)
-            params = self.initiate_param(blk, executor._device)
-            block_params = []
-            self.enable_grad(blk)
-            for op in blk.rps:
-                if isinstance(op, QuantableOperation) and op.is_computing_op:
-                    for var in op.inputs[1:]:
-                        block_params.append(var.value)
-            for (cfg, delegator) in params.items():
-                executor.register_quantize_delegate(cfg, delegator)
-                block_params.extend(delegator.collect_params())
+    def dequantize_graph(self, graph: BaseGraph, exceptions: List[Operation]=[]) -> None:
+       for op in graph.operations.values():
+           if isinstance(op, QuantableOperation) and op not in exceptions:
+               op.dequantize(expire_device=None)
    
-            optimizer = torch.optim.Adam([param for param in block_params if param.requires_grad], lr=self.lr)
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [int(self.epochs / 2), int(self.epochs * 2 / 3)])
+    def restore_quantization_state(self, graph: BaseGraph, exceptions: List[Operation]=[]) -> None:
+        for op in graph.operations.values():
+            if isinstance(op, QuantableOperation) and op not in exceptions:
+                op.restore_quantize_state(expire_device=None)
 
-            for _ in tqdm(range(self.epochs), total=self.epochs, desc=f'Optimize block {blk_idx + 1}/{len(blocks)}'):
-                epoch_loss = {name: 0.0 for name in output_names}
-                for idx,data in enumerate(block_dataloader):
-                    fp_outputs, quant_input = data
-                    quant_outputs = executor.partial_graph_forward(blk.rps, {blk.sp.inputs[0].name: quant_input}, output_names)
-                    if str(executor._device) != self.collecting_device:
-                        quant_input = quant_input.to(executor._device)
-                        fp_outputs  = [output.to(executor._device) for output in fp_outputs]
-                    optimizer.zero_grad()
-                    batch_loss = 0.0
-                    for name, fp_output, quant_output in zip(output_names, fp_outputs, quant_outputs):
-                        loss = torch_mean_square_error(fp_output, quant_output)
-                        batch_loss += loss
-                        epoch_loss[name] += loss.detach().item()
-                    batch_loss.backward()
-                    optimizer.step()
-                scheduler.step()
-                for name in epoch_loss:
-                    logger.debug(f'Epoch {_ + 1} || output variable {name} || avg MSE loss = {epoch_loss[name] / (idx + 1) :.5f}')
-                logger.debug(f'Total avg MSE loss {sum(list(epoch_loss.values())) / (idx + 1) :.5f}')
+    def check(self, op: Operation, graph: BaseGraph) -> List[Operation]:
+        # make sure we only tune activation scales for variables whose state
+        # is activated
+        if not op.is_computing_op:
+            return []
+        downstream_ops = graph.get_downstream_operations(op)
+        if op.config.output_quantization_config[0].state == QuantizationStates.ACTIVATED:
+            return [op]
+        elif op.config.output_quantization_config[0].state == QuantizationStates.OVERLAPPED\
+            and len(downstream_ops) == 1 and isinstance(downstream_ops[0], QuantableOperation):
+            op_type, cfg = downstream_ops[0].type, downstream_ops[0].config.output_quantization_config[0]
+            if (op_type in PPLCUDA_ACTIVATIONS or op_type in LINEAR_ACTIVATIONS) and \
+                    op.config.output_quantization_config[0].dominated_by == cfg:
+                    return [op, downstream_ops[0]]
+        return []
+    
+    def prepare_quantize_input(self, op: Operation, params: Dict[str, Dict[str, torch.Tensor]]) -> List[torch.Tensor]:
+        # perform quantization of weight and bias of computing ops using straight through estimation
+        all_params = []
+        weight_name, weight, cfg = op.inputs[1].name, op.inputs[1].value, op.config.input_quantization_config[1]
+        grad_scale = 1.0 / (weight.numel() * cfg.quant_max)**0.5
+        s_scale = (params[weight_name]['scale'] - params[weight_name]['scale'] * grad_scale).detach()\
+             + params[weight_name]['scale'] * grad_scale
+        bias = params[weight_name]['bias']
+        if cfg.policy.has_property(QuantizationProperty.PER_CHANNEL):
+            shape = [1 if axis != cfg.channel_axis else -1 for axis in range(weight.ndim)]
+            s_scale = s_scale.view(shape)
+            bias = bias.view(shape)
 
-            original_block_loss = sum(list(original_loss.values()))
-            lsq_block_loss = sum(list(epoch_loss.values())) / (idx + 1)
-            logger.info(f'Original Loss {original_block_loss :.5f} || Optimized Loss {lsq_block_loss :.5f}')
+        s_scale = s_scale.abs()
+        weight_quant = (weight + bias) / s_scale
+        weight_quant_round = ppq_tensor_round(weight_quant, cfg.rounding)
 
-            for cfg, delegator in params.items():
-                if lsq_block_loss < original_block_loss:
-                    delegator.finalize()
-                executor.remove_quantize_delegate(cfg)
-            
-            self.disable_grad(blk)
-            if original_block_loss < lsq_block_loss:
-                logger.warning('Loss not improved, abandon trained values...')
-                self.recover(blk)
+        weight_quant_round = (weight_quant_round - weight_quant).detach() + weight_quant
+        weight_quant_round = torch.clamp(weight_quant_round, cfg.quant_min, cfg.quant_max)
+        weight_dequant = weight_quant_round * s_scale - bias
+        all_params.append(weight_dequant)
+
+        if len(op.inputs) > 2:
+            Bias, cfg = op.inputs[2].value, op.config.input_quantization_config[2]
+            input_scale = convert_any_to_torch_tensor(op.config.input_quantization_config[0].scale,\
+                device=Bias.device, dtype=torch.float32)
+            if cfg.policy.has_property(QuantizationProperty.PER_CHANNEL):
+                input_scale = input_scale.view(shape)
+            Bias_scale = (s_scale * input_scale * self.scale_multiplier).reshape(-1)
+            Bias_quant = Bias / Bias_scale
+            Bias_quant_round = ppq_tensor_round(Bias_quant, cfg.rounding)
+            Bias_quant_round = (Bias_quant_round - Bias_quant).detach() + Bias_quant
+            Bias_quant_round = torch.clamp(Bias_quant_round, cfg.quant_min, cfg.quant_max)
+            Bias_dequant = Bias_quant_round * Bias_scale
+            all_params.append(Bias_dequant)
+        return all_params
+    
+    def assign(self, ops: List[Operation], params: List[torch.Tensor]) -> None:
+        # assign trained scales and offsets to config
+        for (var, cfg) in zip(ops[0].inputs[1:2] + ops[-1].outputs[0:1], \
+            ops[0].config.input_quantization_config[1:2] + ops[-1].config.output_quantization_config[0:1]):
+            cfg.scale = params[var.name]['scale'].data.abs()
+            cfg.offset = (params[var.name]['bias'].data / cfg.scale).type(torch.int32)
+        if len(ops[0].inputs) > 2:
+            [cfg_X, cfg_W, cfg_b] = ops[0].config.input_quantization_config
+            cfg_b.scale = self.scale_multiplier * cfg_X.scale * cfg_W.scale
+    
+    def compute_original_loss(self,
+                            ops: List[Operation],
+                            graph: BaseGraph,
+                            dataloader: Iterable,
+                            collate_fn: Callable,
+                            executor: BaseGraphExecutor
+    ) -> float:
+        loss = 0.0
+        for idx,data in tqdm(enumerate(dataloader), total=len(dataloader), desc='Computing Original Loss'):
+            if collate_fn is not None:
+                data = collate_fn(data)
+            self.dequantize_graph(graph)
+            fp_outputs = executor.forward(data, [ops[-1].outputs[0].name])[0]
+            self.restore_quantization_state(graph)
+            quant_outputs = executor.forward(data, [ops[-1].outputs[0].name])[0]
+            batch_loss = torch_mean_square_error(quant_outputs, fp_outputs)
+            loss += batch_loss.detach().item()
+        return loss / (idx + 1)            
+    
+    def recover(self, ops: List[Operation]) -> None:
+        for op in ops:
+            op.dequantize()
+            op.store_parameter_value()
+            op.restore_quantize_state()
+
+    def quant_activation(self,
+                        operation: Operation,
+                        activations: List[torch.Tensor],
+                        all_params: Dict[str, Dict[str, torch.Tensor]]
+    ) -> List[torch.Tensor]:
+        # perform activation quantization by straight through estimation
+        act, cfg = activations[0], operation.config.output_quantization_config[0]
+        scale, bias = all_params[operation.outputs[0].name]['scale'], all_params[operation.outputs[0].name]['bias']
+        if cfg.policy.has_property(QuantizationProperty.PER_CHANNEL):
+            shape = [1 if axis != cfg.channel_axis else -1 for axis in range(act.ndim)]
+            scale = scale.view(shape)
+            bias = bias.view(shape)
+        scale = scale.abs()
+        act_quant = (act + bias) / scale
+        act_quant_round = ppq_tensor_round(act_quant, cfg.rounding)
+        act_quant_round = (act_quant_round - act_quant).detach() + act_quant
+        act_quant_round = torch.clamp(act_quant_round, cfg.quant_min, cfg.quant_max)
+        act_dequant = act_quant_round * scale - bias
+        return [act_dequant]
+
+    def manual_execute(self,
+                    inputs: Union[dict, list, torch.Tensor],
+                    all_ops: List[List[Operation]],
+                    all_params: Dict[str, Dict[str, torch.Tensor]],
+                    executor: BaseGraphExecutor,
+                    output_names: List[str]=[]
+    ) -> List[torch.Tensor]:
+        # manually execute for graphwise optimization, for variables needing optimization, we
+        # substitude the quantization function with straight through estimation functions for
+        # gradient transport
+        if isinstance(inputs, dict):
+            for name, value in inputs.items():
+                if name not in executor._graph.variables:
+                    raise KeyError(f'Can not find variable {name} in your graph.')
+                else:
+                    var = executor._graph.variables[name]
+                    var.value = value
+        else:
+            inputs = executor.prepare_input(inputs=inputs)
+            for key, value in inputs.items():
+                assert isinstance(value, torch.Tensor), \
+                    f'TorchExecutor can only accept tensor as its input, while {type(value)} was given'
+                executor._graph_input_dictionary[key].value = value
+
+        last_idx = 0
+        if len(output_names) == 0:
+            output_names = [name for name in executor._graph.outputs]
+        for name in output_names:
+            if name not in executor._graph.variables:
+                raise KeyError(f'You are requiring output value of variable {name}(is not a variable name), '
+                    'however it is not a valid variable of current graph.')
+            source_op = executor._graph.variables[name].source_op
+            if source_op is not None:
+                last_idx = max(last_idx, executor._executing_order.index(source_op) + 1)
+        
+        visited_op, result_collector = [], [None for _ in output_names]
+
+        for name in output_names:
+            if name in inputs: 
+                result_collector[output_names.index(name)] = inputs[name]
+
+        for operation in executor._executing_order[: last_idx]:
+            try:
+                platform_dispatching_table = GLOBAL_DISPATCHING_TABLE[operation.platform]
+                operation_forward_func = platform_dispatching_table[operation.type]
+                inputs = [var.value for var in operation.inputs]
+
+                if isinstance(operation, QuantableOperation):
+                    input_configs = [_ for _ in operation.config.input_quantization_config]
+                    # replace by scale-trainable quant func
+                    if any([operation in ops[0:1] for ops in all_ops]):
+                        inputs = [executor._quant_function(inputs[0], input_configs[0])]
+                        inputs = inputs + self.prepare_quantize_input(operation, all_params)
+                    else:
+                        inputs = [executor._quant_function(input, config) for input, config in zip(inputs, input_configs)]
+
+                outputs = operation_forward_func(operation, inputs, executor._executing_contenxt)
+                outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+
+                if isinstance(operation, QuantableOperation):
+                    output_configs = [_ for _ in operation.config.output_quantization_config]
+                    # replace by scale-trainable quant func
+                    if any([operation in ops[-1:] for ops in all_ops]):
+                        outputs = self.quant_activation(operation, outputs, all_params)
+                    else:
+                        outputs = [executor._quant_function(output, config) for output, config in zip(outputs, output_configs)]
+
+                for output_idx, output_var in enumerate(operation.outputs):
+                    output_var       = operation.outputs[output_idx]
+                    output_var.value = outputs[output_idx]
+                    if output_var.name in output_names:
+                        result_collector[output_names.index(output_var.name)] = outputs[output_idx]
+
+            except Exception as _:
+                raise RuntimeError(f'Error happens when dealing with operation {str(operation)}')
+
+            visited_op.append(operation)
+            for var in operation.inputs:
+                if var.is_parameter: continue
+                if all(op in visited_op for op in var.dest_ops):
+                    var.value = None
+
+        for var in executor._graph.variables.values():
+            if not var.is_parameter:
+                var.value = None
+
+        return result_collector
+
+
+    def LSQ_optimize_layer(self,
+                     ops: List[Operation],
+                     graph: BaseGraph,
+                     dataloader: Iterable,
+                     collate_fn: Callable,
+                     executor: BaseGraphExecutor
+    ) -> None:
+        original_loss = self.compute_original_loss(ops, graph, dataloader, collate_fn, executor)
+        params = self.initiate_param(ops, executor._device)
+        self.enable_grad(ops)
+        all_params = [var.value for var in ops[0].inputs[1:]]
+        for var_name in params:
+            all_params.append(params[var_name]['scale'])
+            all_params.append(params[var_name]['bias'])
+
+        optimizer = torch.optim.Adam([param for param in all_params if param.requires_grad], lr=self.lr)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [int(self.epochs / 2), int(self.epochs * 2 / 3)])
+        
+        for _ in range(self.epochs):
+            epoch_loss = 0.0
+            for idx,data in tqdm(enumerate(dataloader), total=len(dataloader), desc=f'Epoch {_ + 1}/{self.epochs}'):
+                if collate_fn is not None:
+                    data = collate_fn(data)
+                self.dequantize_graph(graph)
+                fp_outputs = executor.forward(data, [ops[-1].outputs[0].name])
+                self.restore_quantization_state(graph)
+                inputs = executor.forward(data, [ops[0].inputs[0].name])
+                inputs = inputs + self.prepare_quantize_input(ops[0], params)
+                for op in ops:
+                    outputs = executor.operation_forward(op, inputs, False, False)
+                    inputs = outputs
+                act_dequant = self.quant_activation(ops[-1], outputs, params)
+                optimizer.zero_grad()
+                batch_loss = torch_mean_square_error(fp_outputs[0], act_dequant[0])
+                batch_loss.backward()
+                optimizer.step()
+                epoch_loss += batch_loss.detach().item()
+            scheduler.step()
+            avg_loss = epoch_loss / (idx + 1)
+            logger.info(f'Epoch {_ + 1} || avg loss = {avg_loss}')
+
+        self.disable_grad(ops)
+        logger.info(f'Original Loss {original_loss} || LSQ Loss {avg_loss}')
+        if avg_loss < original_loss:
+            self.assign(ops, params)
+        else:
+            self.recover(ops)
+            logger.info('Loss not improved, abandon trained values...')
+
+    def LSQ_optimize_graph(self,
+                     all_ops: List[List[Operation]],
+                     graph: BaseGraph,
+                     dataloader: Iterable,
+                     collate_fn: Callable,
+                     executor: BaseGraphExecutor
+    ) -> None:
+        all_params, trainable_params = {}, []
+        for ops in all_ops:
+            all_params.update(self.initiate_param(ops, executor._device))
+            self.enable_grad(ops)
+            trainable_params.extend([var.value for var in ops[0].inputs[1:]])
+        for var_name in all_params:
+            trainable_params.append(all_params[var_name]['scale'])
+            trainable_params.append(all_params[var_name]['bias'])
+
+        optimizer = torch.optim.Adam([param for param in trainable_params if param.requires_grad], lr=self.lr)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [int(self.epochs / 2), int(self.epochs * 2 / 3)])
+
+        for _ in range(self.epochs):
+            epoch_loss = 0.0
+            for idx,data in tqdm(enumerate(dataloader), total=len(dataloader), desc=f'Epoch {_ + 1}/{self.epochs}'):
+                if collate_fn is not None:
+                    data = collate_fn(data)
+                self.dequantize_graph(graph)
+                if len(self.output_names) == 0:
+                    fp_outputs = executor.forward(data)
+                else:
+                    fp_outputs = executor.forward(data, self.output_names)
+                self.restore_quantization_state(graph)
+                quant_outputs = self.manual_execute(data, all_ops, all_params, executor, self.output_names)
+                optimizer.zero_grad()
+                batch_loss = 0.0
+                for fp_output, quant_output in zip(fp_outputs, quant_outputs):
+                    batch_loss += torch_mean_square_error(fp_output, quant_output)
+                batch_loss.backward()
+                optimizer.step()
+                epoch_loss += batch_loss.detach().item()
+            scheduler.step()
+            avg_loss = epoch_loss / (idx + 1)
+            logger.info(f'Epoch {_ + 1} || avg loss = {avg_loss}')
+
+        for ops in all_ops:
+            self.disable_grad(ops)
+            self.assign(ops, all_params)
+
 
     def optimize(self, processer: GraphCommandProcesser, 
                  dataloader: Iterable, executor: BaseGraphExecutor,
                  collate_fn: Callable,
                  **kwargs) -> None:
         graph = processer.graph
-        blocks = find_all_blocks(graph, executor._executing_order)
+        sorted_ops = graph.topological_sort()
+
         if len(self.interested_layers) == 0:
-            logger.info('No layers are given, all blocks will be tuned by default')
-            final_blocks = blocks
+            logger.info('Note that no layers are given, we will try to tune every computing layer')
+            for op in sorted_ops:
+                if isinstance(op, QuantableOperation) and op.is_computing_op:
+                    self.interested_layers.append(op.name)
+ 
+        if self.mode == 'layerwise':
+            logger.info('Perform layerwise LSQ optimization...')
+            for idx, op in enumerate(sorted_ops):
+                if op.name in self.interested_layers:
+                    assert op.is_computing_op, "only computing ops can be selected as interested\
+                    layers and tuned"
+                    ops = self.check(op, graph)
+                    if not ops:
+                        logger.warning(f'Operation {op.name} is not supported for LSQ finetuning for now')
+                    else:
+                        logger.info(f"Optimize Op {'--'.join([op.name for op in ops])}")
+                        self.LSQ_optimize_layer(ops, graph, dataloader, collate_fn, executor)
         else:
-            final_blocks = []
-            for blk in blocks:
-                if any([op.name in self.interested_layers for op in blk.rps]):
-                    final_blocks.append(blk)
-        self.LSQ_optimize(final_blocks, graph, dataloader, collate_fn, executor)
+            logger.info('Perform graphwise LSQ optimization...')
+            all_ops = []
+            for idx, op in enumerate(sorted_ops):
+                if op.name in self.interested_layers:
+                    assert op.is_computing_op, "only computing ops can be selected as interested\
+                    layers and tuned"
+                    ops = self.check(op, graph)
+                    if not ops:
+                        logger.warning(f'Operation {op.name} is not supported for LSQ finetuning for now')
+                    else:
+                        all_ops.append(ops)
+            self.LSQ_optimize_graph(all_ops, graph, dataloader, collate_fn, executor)
 
 
 class AdvancedQuantOptimization(TrainingBasedPass):
@@ -1026,12 +1239,6 @@ class AdvancedQuantOptimization(TrainingBasedPass):
         super().__init__(
             name='PPQ Advanced Optimization Procedure', 
             interested_outputs=interested_outputs, verbose=verbose)
-        
-        if not USING_CUDA_KERNEL:
-            raise PermissionError(
-                'Advanced Quant Optimization requires compliation of ppq cuda kernels. '
-                'This method is no longer available with pure torch execution Since PPQ 0.6.4, '
-                'set PPQ.USING_CUDA_KERNEL = True or use LSQ optimization instread.')
 
         self.lr                = lr
         self.collecting_device = collecting_device
@@ -1066,7 +1273,7 @@ class AdvancedQuantOptimization(TrainingBasedPass):
         dataloader: Iterable, collate_fn:Callable) -> None:
 
         # initialize training environment.
-        loss_ema    = EMARecorder(beta=0.98)
+        losses      = []
         cur_iter    = 0
         delegators  = []
         device      = executor._executing_contenxt.executing_device
@@ -1075,22 +1282,22 @@ class AdvancedQuantOptimization(TrainingBasedPass):
         dataset = RandomMemDataset(data=[[qt, fp] for qt, fp in zip(quant_inputs, fp32_outputs)])
 
         # create trainable delegators for each parameter.
-        trainable_params = []
+        trainable_vars = []
         for operation in block.rps:
             if operation.is_computing_op and isinstance(operation, QuantableOperation):
                 for cfg, var in operation.config_with_variable:
                     if not var.is_parameter: continue
-                    trainable_params.append((var, cfg))
+                    trainable_vars.append((var, cfg))
     
-        delegators = [RQTDelegator(config=cfg, limit=self.limit, binding=var) for var, cfg in trainable_params]     
+        delegators = [RQTDelegator(config=cfg, limit=self.limit, binding=var) for var, cfg in trainable_vars]     
         optimizer = torch.optim.Adam(params=[d.binding.value for d in delegators], lr=self.lr)
-        shcduler  = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lambda t: 1 / (1 << (t // 5000)))
         # register all quantization delegators
         for d in delegators: executor.register_quantize_delegate(d.config, d)
-
+        
         with tqdm(total=self.target_step) as t:
             while cur_iter < self.target_step:
                 qt_input, fp_output = dataset.pop()
+
                 qt_input, fp_output = qt_input.to(device), fp_output.to(device)
                 qt_output = executor.partial_graph_forward(
                     operations=block.rps, feed_dict={input_var.name: qt_input}, 
@@ -1102,17 +1309,34 @@ class AdvancedQuantOptimization(TrainingBasedPass):
                 quant_loss = torch_mean_square_error(qt_output, fp_output)
                 total_loss = quant_loss + round_loss * OPTIM_ADVOPT_RLOSS_MULTIPLIER
                 total_loss.backward()
-
-                loss_ema.push(total_loss.item())
                 optimizer.step()
-                if OPTIM_ADVOPT_USING_SCEHDULER: shcduler.step()
 
                 cur_iter += 1
+                
                 if cur_iter % 50 == 0:
                     t.set_description(desc=f'Block [{self._bidx + 1}/{self._num_of_blocks}]')
-                    t.set_postfix(loss = loss_ema.pop())
+                    t.set_postfix(loss = total_loss.item())
                     t.update(50)
 
+            # clear loss state
+            losses.clear()
+
+        # DEBUG INFO
+        '''
+        for raw, binding, alpha in zip([d.raw for d in delegates], 
+                                       [d.binding for d in delegates], 
+                                       [d.alpha for d in delegates]):
+            print(alpha.shape)
+            print(' ------ GARD ------')
+            print(alpha._grad.flatten()[:10])
+            print(' ------ VALUE ------')
+            print(alpha.flatten()[:10])
+            print(' ------ RAW ------')
+            print(raw.flatten()[:10])
+            print(' ------ BINDING ------')
+            print(binding.value.flatten()[:10])
+        '''
+        
         # finalize all delegates
         for delegator in delegators:
             assert isinstance(delegator, RQTDelegator)
@@ -1134,8 +1358,7 @@ class AdvancedQuantOptimization(TrainingBasedPass):
     def optimize(
         self, processer: GraphCommandProcesser, dataloader: Iterable,
         executor: TorchExecutor, collate_fn: Callable, **kwargs) -> None:
-        if self._verbose: self.report()
-
+        
         if self._interested_outputs is None:
             self._interested_outputs = [name for name in processer.graph.outputs]
 
@@ -1165,15 +1388,8 @@ class AdvancedQuantOptimization(TrainingBasedPass):
         blocks, visited = [], set()
         for op in interested_ops:
             if op in visited: continue
-            block = block_builder.build(op, limit=OPTIM_ADVOPT_GRAPH_MAXDEPTH)
-            
-            # PATCH 20220317 drop block that has no computing op.
-            if all([rp.is_computing_op == False for rp in block.rps]): continue
-            if block.sp.is_computing_op == False: continue
-
-            for rp in block.rps:
-                if rp != block.sp and rp != block.ep:
-                    visited.add(rp)
+            block = block_builder.build(op, limit=OPTIM_ADVOPT_GRAPH_MAXSIZE)
+            for rp in block.rps: visited.add(rp)
             blocks.append(block)
 
         # set up checkpoints
@@ -1221,19 +1437,6 @@ class AdvancedQuantOptimization(TrainingBasedPass):
             quant_inputs.clear()
             empty_cache()
 
-    def report(self):
-        print('')
-        print('Check your Configuration Again, PPQ fine-tuning procedure will take a few minutes.')
-        print('-----------------------------------------')
-        print(f'Learning Rate:     {self.lr}')
-        print(f'Block Depth:       {OPTIM_ADVOPT_GRAPH_MAXDEPTH}')
-        print(f'Check Flag:        {self.check_flag}')
-        print(f'Training Steps:    {self.target_step}')
-        print(f'Interested Layers: {self.interested_layers}')
-        print(f'Finetune Limit:    {self.limit}')
-        print(f'Cache Device:      {self.collecting_device}')
-        print('-----------------------------------------')
-
 
 class LearningToCalibPass(TrainingBasedPass):
     """
@@ -1256,150 +1459,58 @@ class LearningToCalibPass(TrainingBasedPass):
         ATTENTION: ONLY CONFIGURATION WITH STATE "ACTIVED" WILL BE TUNED VIA THIS FUNCTION.
     """
     
-    def __init__(self, method: str = 'e-greedy', 
+    def __init__(self, 
+                 interested_output: List[str] = None, method: str = 'TS', 
                  calib_act: bool = True, calib_weight: bool = True) -> None:
-        self.method            = method
-        self.calib_act         = calib_act
-        self.calib_weight      = calib_weight
-        self.target_step       = 7500
-        self.e                 = 0.1
-        self.collecting_device = 'cuda'
-        self.arms              = [1, 0.9, 1.1, 0.7, 1.3] 
-        # for power-of-2 policy, use bandit like [0.5, 1, 2]
-        super().__init__('RL Based Calibration Pass')
+        self.interested_output = interested_output
+        self.method = method
+        self.calib_act = calib_act
+        self.calib_weight = calib_weight
+        self.bandit_arms = [0.7, 0.82, 0.9, 0.97, 1, 1.03, 1.1, 1.18, 1.3] # for power-of-2 policy, use bandit like [0.5, 1, 2]
+        super().__init__('Sampling Based Calibration Pass')
 
-    @ torch.no_grad()
-    def calib_block(self, quant_inputs: List[torch.Tensor], fp32_outputs: List[torch.Tensor],
-        executor: TorchExecutor, block: TrainableBlock, dataloader: Iterable, collate_fn: Callable):
-
-        # create trainable delegators for each parameter.
-        delegators = []
-        for operation in block.rps:
-            if isinstance(operation, QuantableOperation):
-                for cfg, var in operation.config_with_variable:
-                    if cfg.state == QuantizationStates.ACTIVATED:
-                        delegators.append(BanditDelegator(arms=self.arms, config=cfg))
-        delegators = [d for d in delegators if isinstance(d, BanditDelegator)]
-        dataset = RandomMemDataset(data=[[qt, fp] for qt, fp in zip(quant_inputs, fp32_outputs)])
-        device  = executor._executing_contenxt.executing_device
-        loss_ema    = EMARecorder(beta=0.98)
-        output_var  = block.ep.outputs[0]
-        input_var   = block.sp.inputs[0]
-        
-        for delegator in delegators:
-            executor.register_quantize_delegate(config=delegator.config, delegator=delegator)
-        
-        cur_iter = 0
-        with tqdm(total=self.target_step) as t:
-            while cur_iter < self.target_step:
-                qt_input, fp_output = dataset.pop()
-                qt_input, fp_output = qt_input.to(device), fp_output.to(device)
-
-                qt_output = executor.partial_graph_forward(
-                    operations=block.rps, feed_dict={input_var.name: qt_input}, 
-                    output_names=[output_var.name])[0]
-
-                loss = torch_snr_error(y_pred=qt_output, y_real=fp_output).item()
-                for delegator in delegators: delegator.mark(1 - loss)
-                loss_ema.push(loss)
-
-                cur_iter += 1
-                if cur_iter % 50 == 0:
-                    t.set_description(desc=f'Block [{self._bidx + 1}/{self._num_of_blocks}]')
-                    t.set_postfix(loss = loss_ema.pop())
-                    t.update(50)
-
-        for delegator in delegators:
-            executor.remove_quantize_delegate(config=delegator.config)
-            delegator.finalize()
-        
-        if not self.check(executor=executor, dataloader=dataloader, collate_fn=collate_fn):
-            for delegator in delegators:
-                delegator.withdraw()
-
-    def collect_training_data(
-        self, output_name: str,
-        dataloader: Iterable,
-        executor: BaseGraphExecutor, 
-        collate_fn: Callable) -> List[List[torch.Tensor]]:
-
-        output_collector = []
-        for data in dataloader:
-            if collate_fn is not None: data = collate_fn(data)
-            [output] = executor.forward(data, output_names=[output_name])
-            output_collector.append(output.to(self.collecting_device))
-        return output_collector
+    def compute_loss(self, y_preds: List[torch.Tensor], y_reals: List[torch.Tensor]) -> float:
+        return sum(
+            torch_mean_square_error(y_pred=y_pred, y_real=y_real).item() 
+            for y_pred, y_real in zip(y_preds, y_reals))
 
     def optimize(self, processer: GraphCommandProcesser, 
                  dataloader: Iterable, executor: TorchExecutor, 
                  collate_fn: Callable, **kwargs) -> None:
-        
-        graph         = processer.graph
-        block_builder = BlockBuilder(graph=graph, topo_order=executor._executing_order)
+        graph = processer.graph
+        interested_outputs = [name for name in graph.outputs]
+        target_iter, samples_per_iter = 5, 2048
 
-        # check if there is any baked value inside your graph
+        # find all trainable configs
+        training_configs = []
         for operation in graph.operations.values():
             if isinstance(operation, QuantableOperation):
                 for cfg, var in operation.config_with_variable:
-                    if cfg.state in {QuantizationStates.BAKED, QuantizationStates.PASSIVE_BAKED}:
-                        raise PermissionError('Can not apply advanced optimization pass when weight value is baked. '
-                                              f'Variable {var.name} has a baked value.')
+                    if (cfg.state == QuantizationStates.ACTIVATED and 
+                        cfg.policy.has_property(QuantizationProperty.PER_TENSOR)):
+                        training_configs.append(cfg)
 
-        # build all blocks, drop overlapped layers.
-        blocks, visited = [], set()
-        for op in graph.operations.values():
-            if op in visited: continue
-            block = block_builder.build(op, limit=OPTIM_ADVOPT_GRAPH_MAXDEPTH)
-            
-            # PATCH 20220317 drop block that has no computing op.
-            if all([rp.is_computing_op == False for rp in block.rps]): continue
-            if block.sp.is_computing_op == False: continue
+        for iter in range(target_iter):
+            bandits = [BanditDelegator(arms=self.bandit_arms, config=config) for config in training_configs]
+            for bandit in bandits: executor.register_quantize_delegate(bandit.config, bandit)
 
-            for rp in block.rps: visited.add(rp)
-            blocks.append(block)
-
-        self.initialize_checkpoints(
-            graph=graph, executor=executor, 
-            dataloader=dataloader, collate_fn=collate_fn)
-
-        graph         = processer.graph
-        block_builder = BlockBuilder(graph=graph, topo_order=executor._executing_order)
-
-        for bidx, block in enumerate(blocks):
-            self._bidx, self._num_of_blocks = bidx, len(blocks)
-            assert isinstance(block, TrainableBlock)
-
-            end_op       = block.ep
-            block_input  = block.sp.inputs[0]
-            block_output = end_op.outputs[0]
-
-            # dequantize prefix operations and block operations
-            for op in graph.operations.values():
-                if isinstance(op, QuantableOperation): 
-                    op.dequantize()
-                    # can not use dequantize_immediately cause weight has been changed.
-                    # self.dequantize_immediately(op)
-
-            fp32_outputs = self.collect_training_data(
-                output_name=block_output.name, dataloader=dataloader, 
-                executor=executor, collate_fn=collate_fn)
-
-            # quantize prefix operations and block operations
-            for op in graph.operations.values():
-                if isinstance(op, QuantableOperation): 
-                    op.restore_quantize_state()
-
-            quant_inputs = self.collect_training_data(
-                output_name= block_input.name, dataloader=dataloader, 
-                executor=executor, collate_fn=collate_fn)
-
-            # start training, solve the best parameters
-            self.calib_block(
-                quant_inputs=quant_inputs, fp32_outputs=fp32_outputs,
-                executor=executor, block=block,
-                dataloader=dataloader, collate_fn=collate_fn)
-
-            # empty cache.
-            fp32_outputs.clear()
-            quant_inputs.clear()
-            empty_cache()
+            for data in tqdm(dataloader):
+                data = collate_fn(data)
+                
+                self.dequantize_graph_immediately(graph)
+                fp_refs = executor.forward(data)
+                
+                for bandit in bandits: bandit.active = False
+                self.quantize_graph_immediately(graph)
+                qt_refs = executor.forward(data)
+                ref_loss = self.compute_loss(y_preds=qt_refs, y_reals=fp_refs)
+                
+                # 那有赌狗一直输 ...
+                for bandit in bandits: bandit.active = True
+                for i in range(10):
+                    results = executor.forward(data)
+                    loss = self.compute_loss(y_preds=results, y_reals=fp_refs)
+                    for bandit in bandits: bandit.mark(ref_loss - loss)
+    
+            for bandit in bandits: bandit.finalize()
+            for bandit in bandits: executor.remove_quantize_delegate(bandit.config)

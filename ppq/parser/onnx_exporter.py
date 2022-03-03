@@ -2,44 +2,17 @@ import json
 from typing import Union
 
 import numpy as np
-import onnx
 import torch
-from onnx import helper, numpy_helper
 from ppq.core import (EXPORT_DEVICE_SWITCHER, EXPORT_PPQ_INTERNAL_INFO,
                       ONNX_EXPORT_NAME, ONNX_EXPORT_OPSET, ONNX_VERSION,
                       PPQ_NAME, DataType, convert_any_to_numpy)
-from ppq.IR import (BaseGraph, GraphExporter, Operation, OperationExporter,
-                    Variable)
+from ppq.IR import BaseGraph, GraphExporter, Operation, Variable
 from ppq.IR.morph import GraphDeviceSwitcher
 from ppq.IR.quantize import QuantableOperation
-from ppq.core.defs import ppq_warning
 
+import onnx
+from onnx import helper, numpy_helper
 
-class ConstantOfShapeExporter(OperationExporter):
-    def export(self, operation: Operation, graph: BaseGraph, **kwargs) -> Operation:
-        # PATCH 20211203, ConstantOfShape Op causes an export error.
-        # 这一问题是由 ConstantOfShape 中的 value 格式问题引发的，下面的代码将导出正确的格式
-        operation.attributes['value'] = numpy_helper.from_array(operation.attributes['value'])
-        return operation
-
-class MMCVExporter(OperationExporter):
-    def export(self, operation: Operation, graph: BaseGraph, **kwargs) -> Operation:
-        # MMCV operation must have a domain attribute.
-        operation.attributes['domain'] = 'mmcv'
-        return operation
-
-class InterpExporter(OperationExporter):
-    def export(self, operation: Operation, graph: BaseGraph, **kwargs) -> Operation:
-        # PATCH 20211216, interp op can not export input_shape attribute.
-        operation.attributes.pop('input_shape')
-        return operation
-
-OPERATION_EXPORTERS = {
-    'ConstantOfShape': ConstantOfShapeExporter,
-    'MMCVRoiAlign': MMCVExporter,
-    'grid_sampler': MMCVExporter,
-    'Interp': InterpExporter,
-}
 
 def convert_value(value: Union[int, float, np.ndarray, torch.Tensor]) -> str:
     if type(value) in {int, float}: return value
@@ -55,13 +28,13 @@ class OnnxExporter(GraphExporter):
 
     def export_quantization_config(
         self, config_path: str, graph: BaseGraph):
-
+        
         render_buffer = {
             'configs': {},
             'dispatchings' : {},
             'values': {}
         }
-
+        
         # Render quantization config.
         for operation in graph.operations.values():
             if isinstance(operation, QuantableOperation):
@@ -92,13 +65,24 @@ class OnnxExporter(GraphExporter):
             json.dump(render_buffer, file, indent=4)
 
     def export_operation(self, operation: Operation) -> onnx.OperatorProto:
-        if operation.type in OPERATION_EXPORTERS:
-            exporter = OPERATION_EXPORTERS[operation.type]()
-            assert isinstance(exporter, OperationExporter), (
-                f'Expected an OpExporter here, however {type(exporter)} was given.')
-            operation = exporter.export(operation=operation, graph=None)
+        attributes = operation.attributes.copy()
+        # PATCH 20211203, ConstantOfShape Op causes an export error.
+        # 这一问题是由 ConstantOfShape 中的 value 格式问题引发的，下面的代码将导出正确的格式
+        if operation.type == 'ConstantOfShape':
+            attributes['value'] = numpy_helper.from_array(attributes['value'])
+
+        # PATCH 20211206, MMCVRoiAlign operation must have a domain attribute.
+        if operation.type in {'MMCVRoiAlign'}:
+            attributes['domain'] = 'mmcv'
         
-        attributes = operation.attributes
+        # PATCH 20211206, grid_sampler operation must have a domain attribute.
+        if operation.type in {'grid_sampler'}:
+            attributes['domain'] = 'mmcv'
+            
+        # PATCH 20211216, interp op can not export input_shape attribute.
+        if operation.type == 'Interp':
+            attributes.pop('input_shape')
+
         for key in attributes:
             value = attributes[key]
             if isinstance(value, DataType):
@@ -123,11 +107,6 @@ class OnnxExporter(GraphExporter):
         else:
             shape, dtype = None, None
 
-        if dtype is None:
-            ppq_warning(f'Data type of Variable {variable.name} is not correctly traced, '
-                        'ppq will export it as fp32 variable to onnx.')
-            dtype = DataType.FP32.value
-
         if not variable.is_parameter:
             tensor_proto = helper.make_tensor_value_info(
                 name=variable.name,
@@ -143,7 +122,7 @@ class OnnxExporter(GraphExporter):
                     value = convert_any_to_numpy(variable.value).flatten()
                 elif value.ndim == 0:
                     value = [value.item(), ] # it is fine for onnx, cause shape for this value will be []
-            else: value = value # value is python primary type.
+            else: value = value # value is numpy.ndarray or python primary type.
             tensor_proto = helper.make_tensor(
                 name=variable.name, data_type=dtype,
                 dims=shape, vals=value)

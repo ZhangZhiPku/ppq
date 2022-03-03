@@ -109,6 +109,15 @@ class ChannelSplitSetting():
         # 是否添加一个小偏移项用来使得量化后的结果尽可能与浮点对齐。
         # cancel out round effect
         self.grid_aware        =  True
+    
+
+class MatrixFactorizationSetting():
+    def __init__(self) -> None:
+        # 所有需要分裂的层的名字，Matrix Factorization 会降低网络执行的性能，你必须手动指定那些层要被分裂
+        # interested layer names on which channel split is desired
+        self.interested_layers = []
+        
+        self.method = 'svd'
 
 
 class AdvancedOptimizationSetting():
@@ -123,31 +132,32 @@ class AdvancedOptimizationSetting():
         
         # 每一轮迭代后是否校验优化结果，建议开启，延长执行时间，提升精度
         # whether to check optimization result after each iteration.
-        self.check                = True
+        self.auto_check           = True
         
-        # 偏移量限制，试试1, 2, 4
-        # offset limitation used in this optimziation, try 1, 2, 4
-        self.offset_limit         = 2.0
+        # 偏移量限制，试试 2, 4, 10
+        # offset limitation used in this optimziation, try 2, 4, 10
+        self.limit                = 4.0
+
+        # 学习率
+        # learning rate.
+        self.lr                   = 3e-4
         
-        # 对那些算子进行优化
-        # optimizing operation types
-        self.interested_types     = ['Gemm', 'Conv', 'ConvTranspose']
+        # 训练步数
+        # training steps
+        self.steps                = 5000
         
-        # 迭代步长，必须控制在 0 ~ 0.5 之间
-        # iteration step, must between 0 ~ 0.5
-        self.step                 = 0.1
+        # 对那些层进行训练，默认为 空数组 则训练全部层
+        # layers that need to be finetuned via this method.
+        # Empty list means all layers need to be finetuned.
+        self.interested_layers = []
         
-        # 是否执行 bias correction，推荐开启，延长执行时间，提升精度
-        # whether to invoke bias correction procedure at the end of iteration
-        self.correct_bias         = True
+        # 一个 variable 列表，指明需要针对那些 variable 进行优化
+        # a list of variable(name), all variable listed will be
+        # optimized via this pass. by default, all output variables
+        # will be listed here.(if empty list was passed)
+        self.interested_outputs = []
         
-        # 最大尝试次数，延长执行时间，提升精度
-        # max optmization trys.
-        self.max_trys             = 8
-        
-        # 学习率，试试 3e-4, 1e-4, 5e-5, 1e-5
-        # learning rate. try 3e-4, 1e-4, 5e-5, 1e-5
-        self.lr                   = 1e-4
+        self.verbose            = True
 
 
 class ActivationQuantizationSetting():
@@ -163,7 +173,7 @@ class ActivationQuantizationSetting():
         # 激活值原地量化，设置为 True 且 USING_CUDA_KERNEL = True，则所有激活值原地量化，不产生额外显存
         # inplace quantization, if USING_CUDA_KERNEL = True, 
         # quantize all activations inplace, do not require extra memory.
-        self.inplace_act_quantization = True
+        self.inplace_act_quantization = False
 
 
 class ParameterQuantizationSetting():
@@ -200,10 +210,6 @@ class QuantizationFusionSetting():
         # only gpu platform support this joint quantization optimization.
         self.fuse_conv_add = False
         
-        # concat 联合定点
-        # joint quantization with all concat inputs.
-        self.fuse_concat   = False
-        
         # computing operation - activation operation 联合定点
         # joint quantization with computing operations and following activations.
         self.fuse_activation = True
@@ -211,6 +217,25 @@ class QuantizationFusionSetting():
         # 省略被动算子的定点，保持算子前后定点信息一致
         # skip passive opeartion's input and output quantization, keep them with a same quantization scale and offset.
         self.fuse_passive_op = True
+        
+        # 对多输入算子执行定点对齐
+        # 对于 Add, Concat 这类具有多个输入的算子，硬件执行时必须要求所有输入位宽相同且量化信息一致
+        # 在 8 bit 网络中，我们不讨论位宽的问题，只讨论量化信息
+        # 选择对齐方式 - Align to Large, 则所有输入量化信息将合并成一个更大范围的量化信息, 
+        #   保证其能表示所有输入的最小值与所有输入的最大值。
+        # 选择对齐方式 - Align to Output, 则所有输入量化信息将全部等同于算子输出的量化信息
+        # 设置 force_alignment_overlap 为 True, 则强制覆盖算子的上游量化信息，对于特殊结构的网络，这可能导致大范围的合并。
+        
+        # For Operations like Add, Concat, hardware requires their inputs share a same quantization config.
+        # So that we implements 2 alignment method here for simulating hardware behaviour:
+        # Align to Large: all input variables will merge their quantization range to a larger one.
+        # Align to Output: all input quantization config will be replaced by output quantization config.
+        # force_alignment_overlap: if set to true, ppq will overlap upstream quantization config, for some networks
+        #   it will incurs configuration coalesce among the whole graph.
+        self.align_quantization   = True
+        self.align_elementwise_to = 'Align to Large'
+        self.align_concat_to      = 'Align to Output'
+        self.force_alignment_overlap = False
 
 
 class TemplateSetting():
@@ -230,6 +255,62 @@ class TemplateSetting():
     def __init__(self) -> None:
         self.my_first_parameter = 'This Parameter just shows you how to create your own parameter.'
 
+
+class BiasCorrectionSetting():
+    def __init__(self) -> None:
+        # 一个 variable 列表，指明需要针对那些 variable 进行优化
+        # a list of variable(name), all variable listed will be
+        # optimized via this pass. by default, all output variables
+        # will be listed here.(if empty list was passed)
+        self.interested_outputs = None
+        
+        # 每一轮迭代后是否校验优化结果，建议开启，延长执行时间，提升精度
+        # whether to check optimization result after each iteration.
+        self.auto_check         = True
+        
+        self.max_steps          = 8
+        
+        self.verbose            = True
+
+
+class LearningStepSizeSetting():
+    def __init__(self) -> None:
+        # should only contain computing ops, if given, ops in interested_layers will be checked and
+        # if conditions are satisfied, weight, scale of weight, scale of activation will be trained
+        # with mse optimization goal, if not given, every condition-satisfied computing op will be 
+        # optimized
+        self.interested_layers = []
+        # num of training epochs, please adjust it to your needs
+        self.epochs            = 30
+        # initial learning rate, by default Adam optimizer and a multistep scheduler with 0.1 decay
+        # are used for convergence
+        self.lr                = 1e-4
+        # scale multiplifer for bias(negative quantized param)
+        self.scale_multiplier  = 2.0
+        # graphwise or layerwise, if mode is set to graphwise, you should make sure valid gradient
+        # could flow back to your parameters from variable specified in output_names
+        self.mode              = 'graphwise'
+        # variable names to compute loss, if not given, the final output will be used
+        # in graphwise mode, be careful in aware of valid back propagation in your graph
+        self.output_names      = []
+
+class BlockwiseReconstructionSetting():
+     def __init__(self) -> None:
+        # if given, only block containing op in interested_layers will be optimized, otherwise every
+        # block in graph will be optimized
+        self.interested_layers  = []
+        # whether to tune activation scale
+        self.tune_act_scale     = True
+        # initial learning rate, by default Adam optimizer and a multistep scheduler with 0.1 decay
+        self.lr                 = 1e-3
+        # number of training epochs
+        self.epochs             = 300
+        # max number of ops contained in a block
+        self.max_block_size     = 4
+        # loss = MSELoss + lamda * RoundingLoss
+        self.lamda              = 1.0
+        # scale multiplifer for bias(negative quantized param)
+        self.scale_multiplier   = 2.0
 
 class Dispatching():
     def __init__(self, operation: str, platform: int) -> None:
@@ -278,12 +359,16 @@ class QuantizationSetting():
         self.ssd_setting                     = SSDEqualizationSetting()
 
         # layer wise equalizition 与相关配置
-        self.equalization                    = True
+        self.equalization                    = False
         self.equalization_setting            = EqualizationSetting()
         
         # OCS channel split configuration
         self.channel_split                   = False
         self.channel_split_setting           = ChannelSplitSetting()
+        
+        # Matrix Factorization Split. (Experimental method)
+        self.matrix_factorization            = False
+        self.matrix_factorization_setting    = MatrixFactorizationSetting()
 
         # activation 量化与相关配置
         self.quantize_activation             = True
@@ -293,9 +378,22 @@ class QuantizationSetting():
         self.quantize_parameter              = True
         self.quantize_parameter_setting      = ParameterQuantizationSetting()
 
-        # 是否启动 advanced_optim 优化算法，该算法整合了 adaround 和 bias correction 算法的功能，
+
+        self.lsq_optimization                = False
+        self.lsq_optimization_setting        = LearningStepSizeSetting()
+
+        
+        self.blockwise_reconstruction         = False
+        self.blockwise_reconstruction_setting = BlockwiseReconstructionSetting()
+
+
+        # 是否启动优化算法降低量化误差
         self.advanced_optimization           = False
         self.advanced_optimization_setting   = AdvancedOptimizationSetting()
+        
+        # 是否启动 bias correction pass
+        self.bias_correct                    = False
+        self.bias_correct_setting            = BiasCorrectionSetting()
 
         # 量化融合相关配置
         self.fusion                          = True
@@ -328,13 +426,17 @@ class QuantizationSettingFactory:
     def pplcuda_setting() -> QuantizationSetting:
         default_setting = QuantizationSetting()
         default_setting.equalization = False
-        default_setting.fusion_setting.fuse_conv_add = True
+        default_setting.fusion_setting.fuse_conv_add = False
         return default_setting
 
     @ staticmethod
     def dsp_setting() -> QuantizationSetting:
         default_setting = QuantizationSetting()
         default_setting.equalization = True
+        default_setting.equalization_setting.opt_level = 1
+        default_setting.equalization_setting.value_threshold = .5
+        default_setting.equalization_setting.iterations = 3
+        
         default_setting.fusion_setting.fuse_conv_add = False
         return default_setting
     

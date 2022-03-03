@@ -1,16 +1,18 @@
+# TODO move training logic to here.
+
 import random
-from math import sqrt, pow
+from math import sqrt
 from random import randint
-from typing import Iterable, List, Tuple, Union
+from typing import Iterable, List, Tuple
 
 import numpy as np
 import torch
 from ppq.core import (NUM_OF_CHECKPOINT_FETCHS, USING_CUDA_KERNEL,
                       ChannelwiseTensorQuantizationConfig, NetworkFramework,
                       QuantizationProperty, QuantizationStates, RoundingPolicy,
-                      TensorQuantizationConfig, convert_any_to_torch_tensor)
+                      TensorQuantizationConfig)
 from ppq.executor import TorchQuantizeDelegate
-from ppq.IR import BaseGraph, Operation, QuantableVariable, Variable
+from ppq.IR import BaseGraph, Operation, Variable
 from ppq.IR.search import SearchableGraph
 from ppq.quantization.qfunction.linear import PPQLinearQuantFunction
 from ppq.utils.fetch import batch_random_fetch
@@ -108,7 +110,6 @@ if not USING_CUDA_KERNEL:
             qt = torch.clamp(qt, quant_min, quant_max)
             qt = (qt - offset) * scale
             return torch.sum(torch.abs(qt - tensor)) / sqrt(qt.numel())
-
 
 else: # if USING_CUDA_KERNEL:
     class Clip_T(Function):
@@ -237,8 +238,6 @@ def PPQTensorClip(
 
 def PPQRoundingLoss(tensor: torch.Tensor,
                     config: TensorQuantizationConfig) -> torch.Tensor:
-    if not QuantizationStates.is_activated(config.state): 
-        return torch.sum(torch.zeros_like(tensor)).unsqueeze(0)
     if config.policy.has_property(QuantizationProperty.PER_CHANNEL):
         assert isinstance(config, ChannelwiseTensorQuantizationConfig)
         return RoundingLoss_C.apply(
@@ -313,13 +312,11 @@ class RQTDelegator(TorchQuantizeDelegate):
             raise PermissionError(f'Can not create TrainableDelegate with variable {binding.name},'
                                   ' cause its value has been baked.')
         
-        limit_t = None
+        limit_t = torch.clone(config.scale)
         # create limit tensor
         if config.state == QuantizationStates.ACTIVATED:
-            limit_t = torch.clone(config.scale)
             limit_t = limit_t * limit
         if config.state == QuantizationStates.PASSIVE:
-            limit_t = torch.clone(config.scale)
             limit_t = limit_t.fill_(limit * (0.01) * torch.max(binding.value).item())
 
         self.reference = binding.value.clone()
@@ -339,67 +336,11 @@ class RQTDelegator(TorchQuantizeDelegate):
 
     def __call__(self, tensor: torch.Tensor, 
                  config: TensorQuantizationConfig) -> torch.Tensor:
-        if not QuantizationStates.is_activated(config.state): return tensor
         if self.limit == 0: return PPQLinearQuantFunction(tensor, config)
-        if not USING_CUDA_KERNEL: return PPQLinearQuantFunction(tensor, config)
-
         return PPQTensorClip(
             tensor=PPQLinearQuantFunction(tensor, config), 
-            reference=self.reference, limit=self.limit_t, config=config)
-
-
-class LSQDelegator(TorchQuantizeDelegate):
-    """
-        Lsq Delegator is an cuda implementation of learned step size quantization.
-        We apply Qdrop together with lsq to lower the variance of gradient estimations.
-        
-        With those features, we could directly finetune a quantized network
-            from 32-bit to lower bit width, avoiding the risk of over-fitting.
-        
-        USE THIS FUNCTION TO REPLACE PPQ EXECUTOR'S QUANTIZATION LOGIC WITH
-            executor.register_quant_delegator(config, LSQDelegator())
-        
-        ATTENTION: THIS FUNCTION IS AVAILABLE ONLY WITH USING_CUDA_KERNEL = True
-    """
-    def __init__(self, binding: Variable, 
-                 config: TensorQuantizationConfig, dropout: float) -> None:
-        if config.state in {QuantizationStates.BAKED, QuantizationStates.PASSIVE_BAKED}:
-            raise PermissionError(f'Can not create TrainableDelegate with variable {binding.name},'
-                                  ' cause its value has been baked.')
-
-        self.config  = config
-        self.binding = binding
-        self.dropout = dropout
-        self.trainable_values = []
-
-        self.scale_backup  = self.config.scale.clone()
-        self.config.scale.requires_grad  = True
-        self.trainable_values.append(self.config.scale)
-
-        if self.config.policy.has_property(QuantizationProperty.ASYMMETRICAL):
-            self.offset_backup = self.config.offset.clone()
-            self.config.offset.requires_grad = True
-            self.trainable_values.append(self.config.offset)
-
-    def withdraw(self):
-        self.config.scale  = self.scale_backup
-        if self.config.policy.has_property(QuantizationProperty.ASYMMETRICAL):
-            self.config.offset = self.offset_backup
-
-    def finalize(self):
-        self.config.scale.requires_grad  = False
-        self.config.scale._grad          = None
-        
-        if self.config.policy.has_property(QuantizationProperty.ASYMMETRICAL):
-            self.config.offset.requires_grad = False
-            self.config.offset._grad         = None
-
-        with torch.no_grad():
-            self.config.offset = torch.clamp(self.config.offset, 0, self.config.quant_max)
-
-    def __call__(self, tensor: torch.Tensor, 
-                 config: TensorQuantizationConfig) -> torch.Tensor:
-        return PPQLinearQuantFunction(tensor, config, dropout=self.dropout)
+            reference=self.reference, limit=self.limit_t, config=config
+        )
 
 
 class BanditDelegator(TorchQuantizeDelegate):
@@ -417,36 +358,66 @@ class BanditDelegator(TorchQuantizeDelegate):
         Multi-arm bandits are introduced since PPQ 0.6.2 for training
             quantization scale and offset.
     """
-    def __init__(self,  arms: List[float], config: TensorQuantizationConfig) -> None:
+    class EMA():
+        def __init__(self, decay):
+            self.decay = decay
+            self.value = 0
+
+        def put(self, value: float):
+            value = (1.0 - self.decay) * value + self.decay * self.value
+    
+    def __init__(self,  arms: List[float], config: TensorQuantizationConfig, smooth: float = 1) -> None:
         if len(arms) < 2: raise ValueError('Can not initialize bandit with less than 2 arms.')
-        self.e = 0.1
         self.arms = arms
         self.num_of_arms = len(arms)
-        self.rewards = [EMARecorder() for _ in range(self.num_of_arms)]
-        self.rewards[0].push(1)
-        self.last_selected = 0
+        self.smooth = smooth
+        self.active = True
+        self.wins   = [0 for _ in range(self.num_of_arms)]
+        self.trials = [0 for _ in range(self.num_of_arms)]
+        self.last_roll = -1
+        assert isinstance(config.scale, torch.Tensor)
         self.reference = config.scale.clone()
         self.config = config
-        self.decay = 0.99
+        self.rewards = {r: [] for r in range(self.num_of_arms)}
 
     def roll(self) -> int:
-        if random.random() > self.e: selected = random.randint(0, len(self.arms) - 1)
-        else: selected = np.argmax([ema.pop() for ema in self.rewards])
-        self.last_selected = selected
-        return selected
+        # print(self.smooth, self.wins,  self.trials)
+        '''
+        rolls = [
+            random.betavariate(self.smooth + self.wins[i] * 0.3, self.smooth + (self.trials[i] - self.wins[i]) * 0.3)
+            for i in range(self.num_of_arms)]
+        '''
+        # r = np.argmax(rolls)
+        if random.random() > 0.5:
+            r = random.randint(0, len(self.arms) - 1)
+        else: 
+            r = np.argmax([sum(v) / (len(v) + 1e-7) for r, v in self.rewards.items()])
+        self.trials[r] += 1
+        self.last_roll = r
+        return r
 
     def mark(self, rewards: float):
-        self.rewards[self.last_selected].push(rewards)
+        self.rewards[self.last_roll].append(rewards)
+        if rewards > 0: self.wins[self.last_roll] += 1
 
     def finalize(self) -> bool:
-        self.config.scale = self.reference * self.arms[np.argmax([ema.pop() for ema in self.rewards])]
+        print('-------------------------------------------')
+        for r, v in self.rewards.items():
+            print(f"Arm {r} | Rewards {sum(v) / (len(v) + 1e-7):.3f} | wins: {self.wins[r]} | trials: {self.trials[r]}")
 
-    def withdraw(self):
-        self.config.scale = self.reference
+        selected = np.argmax(self.wins)
+        eta_reward = sum(self.rewards[selected]) / (len(self.rewards[selected]) + 1e-7)
+        if eta_reward > 0.01: 
+            self.config.scale = self.reference * self.arms[np.argmax(self.wins)]
+            return True
+        else: 
+            self.config.scale = self.reference
+            return False
 
     def __call__(self, tensor: torch.Tensor, 
                  config: TensorQuantizationConfig) -> torch.Tensor:
-        config.scale = self.reference * self.arms[self.roll()]
+        if self.active: config.scale = self.reference * self.arms[self.roll()]
+        else: config.scale = self.reference
         return PPQLinearQuantFunction(tensor, config)
 
 
@@ -507,15 +478,18 @@ class AdaroundRegTerm(torch.nn.Module):
         self.temp_anneal = TimeDecay(self.max_iter, self.warm_ratio)
         super().__init__()
 
-    def rectified_sigmoid(self, round_mask) -> torch.Tensor:
+    def rectified_sigmoid(self, round_mask):
         return ((self.zeta - self.gamma) * torch.sigmoid(round_mask) + self.gamma).clamp(0, 1)
 
-    def forward(self, round_mask, iter) -> torch.Tensor:
+    def forward(self, round_mask, iter, reduction='sum'):
         if iter < self.max_iter * self.warm_ratio:
             round_loss = 0
         else:
             self.beta = self.temp_anneal(iter)
-            round_loss = self.alpha * (1 - torch.pow((self.rectified_sigmoid(round_mask) - 0.5).abs() * 2, self.beta)).sum()
+            if reduction == 'sum':
+                round_loss = self.alpha * (1 - torch.pow((self.rectified_sigmoid(round_mask) - 0.5).abs() * 2, self.beta)).sum()
+            else:
+                round_loss = self.alpha * (1 - torch.pow((self.rectified_sigmoid(round_mask) - 0.5).abs() * 2, self.beta)).mean()
         return round_loss
 
 
@@ -535,12 +509,8 @@ class PriorityQueue:
         self._data = []
         self._ops  = set()
         self._idx  = 0
-        self._lazy_tag = True # 延迟操作标志
     
     def pop(self) -> Tuple[int, Operation]:
-        if not self._lazy_tag: 
-            self._data = sorted(self._data, key=lambda x: x[0])
-            self._lazy_tag = True
         if self._idx >= len(self._data): raise IndexError('Index out of range!')
         ele = self._data[self._idx]
         self._idx += 1
@@ -549,8 +519,8 @@ class PriorityQueue:
     def push(self, depth: int, op: Operation):
         if op in self._ops: return
         self._data.append((depth, op))
+        self._data = sorted(self._data, key=lambda x: x[0])
         self._ops.add(op)
-        self._lazy_tag = False
     
     def empty(self) -> bool:
         return self._idx >= len(self._data)
@@ -596,16 +566,15 @@ class BlockBuilder:
 
     def build(self, op: Operation, limit: int) -> TrainableBlock:
         """
-        子图分割算法, 这个算法将从指定节点出发, 构造一个满足定义的子图结构
         Solving best block from given operation.
         
-        Block defination:(子图定义)
+        Block defination:  
             A Block is a triple contains S, E, M, 
                 where S is the input node of block
                 where E is the output node of block
                 where M contains all nodes inside block
         
-        Property:(子图性质)
+        Property:
             1. Minmal TrainableBlock start from p is {p, p, {p}}, 
                this block have only one node as both input and output.
             2. When S != E, 
@@ -613,31 +582,26 @@ class BlockBuilder:
                S must on every path from graph input to E.
             3. M contains and only contains nodes on all paths from S to E.
         
-        Lemma:(算法引理)
-            1. 如果 s 的后继节点只有一个 e, 且 e 的输入只有一个，那么 {s, e, {s, e}} 构成满足定义的子图，从 s 寻找子图的任务可以递归由 e 完成
-            2. 如果 s 的后继存在多个节点，则只存在两种情况:
-                2.1 从 s 出发，最大子图即为 {s, s, {s}}。
-                2.2 从 s 出发，可以构成子图 {s, e, R} (e!=s), 那么R中必须含有一个节点接收多个输入。（可用反证法证明，略）
+        Lemma:
+            1. 如果 s 的后继节点只有一个 e，且 e 的输入只有一个，那么 {s, e, {s, e}} 构成区块，从 s 寻找区块的任务可以递归由 e 完成
+            2. 如果 s 的后继存在多个节点，则:
+                2.1 从 s 出发，不存在能够符合定义的区块。
+                2.2 从 s 出发，构成的区块内必须含有一个节点接收多个输入。（可用反证法证明，略）
 
-        Algorithm:(算法)
-            Build(s, d):
-                如果区块长度大于所需，则返回现有内容
-                从 s 出发，如果 s 的后继节点只有一个e，则判断e的输入节点个数：
-                    1. 如果 e 是单输入节点，执行Build(e, d-1)，并将其结果与 {s, e, {s, e}} 合并
-                    2. 如果 e 是多输入节点，算法立即停机，返回 {s, s, {s}}
-                
-                如果 s 的后继节点存在多个，找出距离 s 拓扑序最近的多输入的节点 k1，判断 s 到输出的路径是否能够被 k1 阻断
-                    如果 k 成功阻断所有输出，执行Build(k1, d-1)，并将其结果与 {s, k1, F(s, k1)} 合并
+        Algorithm:
+            0. 如果区块长度大于所需，则返回现有内容，否则转 1
+            1. 从 s 出发，如果 s 的后继节点只有一个，则递归寻找从后继节点开始的区块；
+               如果 s 的后继节点存在多个，找出距离 s 拓扑序最近的多输入的节点 k1，判断 s 到输出的路径是否能够被 k1 阻断
+                    如果 k 成功阻断所有输出，递归寻找从 k 开始的区块
                     如果 k 不能阻断输出，寻找距离 s 次近的多输入节点 k2，重复判断
-                直到 kn 到达 s 的距离超出限制
-
-                函数 F(s, k1) 取出 从 s 到 k1 路上的所有节点
+               直到 kn 到达 s 的距离超出限制
 
         可利用引理证明算法正确性，从略
-        时间复杂度: O(kd) k 为节点最大度数 d 为深度限制。建立所有Block所需时间 O(nkd)
+        时间复杂度: O(kd) k 为节点最大度数，d 为深度限制。
+        建立所有Block所需时间 O(nkd)
         """
         def _find_multi_input_ep(op: Operation):
-            # 如果当前节点后继节点存在多个，层序遍历寻找阻断节点
+            # 层序遍历寻找阻断节点
             least_first_queue = PriorityQueue()
             
             for down_op in self.graph.get_downstream_operations(op):
@@ -645,9 +609,7 @@ class BlockBuilder:
             
             while not least_first_queue.empty():
                 iter_operation = least_first_queue.pop()[-1]
-                if (least_first_queue.empty() and 
-                    len(self.graph.get_upstream_operations(iter_operation)) > 1): 
-                    return iter_operation
+                if least_first_queue.empty(): return iter_operation
                 for down_op in self.graph.get_downstream_operations(iter_operation):
                     least_first_queue.push(self.depth[down_op], down_op)
 
@@ -655,7 +617,6 @@ class BlockBuilder:
             return None
 
         def _find_coherent_ep(op: Operation):
-            # 如果当前节点后继节点只有一个，向下寻找直系节点
             ops = self.graph.get_downstream_operations(op)
             if len(ops) == 1 and len(self.graph.get_upstream_operations(ops[0])) == 1: 
                 return ops[0]
@@ -688,186 +649,3 @@ class BlockBuilder:
                 assert up_op in self.depth, ('Oops, that should not happen to your network.')
                 depths_cache.append(self.depth[up_op])
             self.depth[operation] = max(depths_cache) + 1
-
-
-class StraightThroughEstimateDelegator(TorchQuantizeDelegate):
-    def __init__(self,
-                config: TensorQuantizationConfig,
-                is_parameter: bool,
-                scale_multiplier: Union[torch.Tensor, float],
-                device: Union[str, torch.device]='cuda'
-    ) -> None:
-        self.config           = config
-        self.is_parameter     = is_parameter
-        self.policy           = config.policy
-        self.passive          = config.state == QuantizationStates.PASSIVE
-        self.scale_multiplier = scale_multiplier
-        self.scale            = torch.nn.Parameter(convert_any_to_torch_tensor(config.scale, device=device,\
-                            dtype=torch.float32).clone(), requires_grad=True)
-        self.bias             = torch.nn.Parameter(convert_any_to_torch_tensor(config.offset, device=device,\
-                            dtype=torch.float32).clone() * self.scale.detach(), requires_grad=True)
-        self._masters          = []
-    
-    @ property
-    def masters(self):
-        return self._masters
-    
-    @ masters.setter
-    def masters(self, masters) -> None:
-        self._masters = masters
-
-    def collect_params(self) -> List[torch.Tensor]:
-        params = []
-        if len(self.masters) == 0:
-            assert not self.passive, 'master delegators should be set for passive parameters'
-            params.append(self.scale)
-            if self.policy.has_property(QuantizationProperty.ASYMMETRICAL):
-                params.append(self.bias)
-        return params
-    
-    def finalize(self) -> None:
-        if self.config.dominated_by == self.config:
-            if not self.passive:
-                self.config.scale = self.scale.data.abs()
-                self.config.offset = torch.clamp(self.bias.data.abs() / self.scale.data.abs(), \
-                    self.config.quant_min, self.config.quant_max)
-            else:
-                # bias
-                scale = self.scale_multiplier
-                for delegator in self.masters:
-                    assert isinstance(delegator, StraightThroughEstimateDelegator)
-                    scale = scale * delegator.scale.data.abs()
-                self.config.scale = scale
-
-    def __call__(self, tensor: torch.Tensor, config: TensorQuantizationConfig) -> torch.Tensor:
-        
-        scale = self.scale
-        bias  = self.bias
-
-        if len(self.masters) > 0:
-            # could be bias or joint input var
-            scale = self.scale_multiplier
-            for delegator in self.masters:
-                scale = scale * delegator.scale
-            # must be joint input var(one master only)
-            if not self.passive:
-                bias = self.masters[0].bias
- 
-        # must be weight
-        elif self.is_parameter:
-            grad_scale = 1 / (tensor.numel() * config.quant_max)**0.5
-            scale = scale * grad_scale + (scale - scale * grad_scale).detach()
-
-        if config.policy.has_property(QuantizationProperty.PER_CHANNEL):
-            assert isinstance(config, ChannelwiseTensorQuantizationConfig)
-            shape = [1 if axis != config.channel_axis else -1 for axis in range(tensor.ndim)]
-            scale = scale.view(shape)
-            bias = bias.view(shape)
-
-        # only bias doesn't need offset in asym quant
-        if not self.passive and config.policy.has_property(QuantizationProperty.ASYMMETRICAL):
-            tensor = tensor + bias.abs()
-        
-        scale = scale.abs()
-        tensor = tensor / scale
-        tensor_round = ppq_tensor_round(tensor, config.rounding)
-        tensor = (tensor_round - tensor).detach() + tensor
-        tensor = torch.clamp(tensor, config.quant_min, config.quant_max)
-        tensor = tensor * scale 
-        
-        if not self.passive and config.policy.has_property(QuantizationProperty.ASYMMETRICAL):
-            tensor = tensor - bias.abs()
-        return tensor
-
-
-class BlockwiseReconstructionDelegator(StraightThroughEstimateDelegator):
-    def __init__(self,
-                binding_var: QuantableVariable,
-                config: TensorQuantizationConfig,
-                reg: AdaroundRegTerm,
-                scale_multiplier: float,
-                device: Union[str, torch.device]='cuda'
-    ) -> None:
-        super().__init__(config, binding_var.is_parameter, scale_multiplier, device)
-        self.binding_var = binding_var
-        self.reg         = reg
-        self.rounding    = self.initiate_rounding()
-
-    def initiate_rounding(self) -> Union[None, torch.nn.Parameter]:
-        if not self.is_parameter or self.passive:
-            return None
-        weight = self.binding_var.value
-        scale = self.config.scale
-        if self.config.policy.has_property(QuantizationProperty.PER_CHANNEL):
-            assert isinstance(self.config, ChannelwiseTensorQuantizationConfig)
-            shape = [1 if axis != self.config.channel_axis else -1 for axis in range(weight.ndim)]
-            scale = scale.view(shape)
-        round_diff = (weight / scale) - (weight / scale).floor()
-        v_init = -torch.log((self.reg.zeta - self.reg.gamma) / (round_diff - self.reg.gamma) - 1)
-        continuous_v = torch.nn.Parameter(v_init, True)
-        return continuous_v
-
-    def collect_params(self) -> List[torch.Tensor]:
-        params = []
-        # collect scale and offset for act
-        # must be activated
-        if not self.is_parameter:
-            params.extend(super().collect_params())
-        # only collect rounding for weight param
-        elif not self.passive:
-            assert self.rounding is not None, 'rounding param should be intiated for weight param\
-            before finetuning'
-            params.append(self.rounding)
-        return params
-
-    def finalize(self) -> None:
-        # activation or bias
-        if not self.is_parameter or self.passive:
-            return super().finalize()
-        else:
-            weight = self.binding_var.value
-            scale = self.config.scale
-            offset = self.config.offset
-            if self.policy.has_property(QuantizationProperty.PER_CHANNEL):
-                assert isinstance(self.config, ChannelwiseTensorQuantizationConfig)
-                shape = [1 if axis != self.config.channel_axis else -1 for axis in range(weight.ndim)]
-                scale = scale.view(shape)
-                offset = offset.view(shape)
-            weight = (weight / scale).floor() + (self.rounding >= 0).float()
-            weight = torch.clamp(weight + offset, self.config.quant_min, self.config.quant_max)
-            weight = (weight - offset) * scale
-            self.binding_var.value = weight
-
-    def __call__(self, tensor: torch.Tensor, config: TensorQuantizationConfig) -> torch.Tensor:
-        if not self.is_parameter or self.passive:
-            return super().__call__(tensor, config)
-        elif not self.passive:
-            scale = config.scale
-            offset = config.offset
-            if config.policy.has_property(QuantizationProperty.PER_CHANNEL):
-                assert isinstance(config, ChannelwiseTensorQuantizationConfig)
-                shape = [1 if axis != config.channel_axis else -1 for axis in range(tensor.ndim)]
-                scale = scale.view(shape)
-                offset = offset.view(shape)
-            tensor = (tensor / scale).floor() + self.reg.rectified_sigmoid(self.rounding)
-            tensor = torch.clamp(tensor + offset, config.quant_min, config.quant_max)
-            tensor = (tensor - offset) * scale
-            return tensor
-
-
-class EMARecorder():
-    """
-    Exponential Moving Average(EMA) with bias correction.
-    """
-    def __init__(self, beta: float = 0.98):
-        self.beta  = beta
-        self.t     = 0
-        self.value = 0
-
-    def push(self, value: float):
-        self.value = (1.0 - self.beta) * value + self.beta * self.value
-        self.t += 1
-
-    def pop(self) -> float:
-        if self.t == 0: return 0
-        return self.value / (1 - pow(self.beta, self.t))

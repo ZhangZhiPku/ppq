@@ -1,6 +1,7 @@
 import time
 from abc import ABCMeta, abstractmethod
 from typing import Container, Iterable, Iterator, List, Union
+from ppq.core.defs import ppq_info
 
 from ppq.executor import BaseGraphExecutor
 from ppq.IR import BaseGraph, DefaultGraphProcesser, GraphCommandProcesser

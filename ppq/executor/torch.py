@@ -1,11 +1,10 @@
 from typing import Any, Callable, Dict, List, Union
 
 import numpy
-from ppq.core import (DataType, OperationMeta, QuantizationStates,
-                      TargetPlatform, TensorMeta, TensorQuantizationConfig,
-                      empty_ppq_cache, ppq_warning)
+from ppq.core import (OperationMeta, QuantizationStates, TargetPlatform,
+                      TensorMeta, TensorQuantizationConfig, empty_ppq_cache)
 from ppq.IR import BaseGraph, Operation, QuantableOperation, RunnableGraph
-from ppq.IR.base.command import GraphDeployCommand
+from ppq.IR.base.command import GraphDepolyCommand
 from ppq.quantization.qfunction.linear import PPQLinearQuantFunction
 
 import torch
@@ -28,16 +27,7 @@ class TorchMetaDataTracingHook(RuntimeHook):
         self.input_metas, self.output_metas = [], []
         super().__init__(operation, operation_meta=None)
     def pre_forward_hook(self, inputs: list, **kwargs) -> list:
-        # some operations got none as its input
-        # therefore we have to create meta for those none input value manually.
-        for tensor, var in zip(inputs, self._hook_to.inputs):
-            if tensor is None:
-                ppq_warning(
-                    f'Unexpected input value of operation {self._hook_to.name}, '
-                    f'recieving "None" at its input {self._hook_to.inputs.index(var)}')
-                self.input_metas.append(TensorMeta(dtype=DataType.NONETYPE, shape=None))
-            else:
-                self.input_metas.append(build_meta(tensor))
+        self.input_metas = [build_meta(tensor) for tensor in inputs]
         return inputs
     def post_forward_hook(self, outputs: list, **kwargs) -> list:
         self.output_metas = [build_meta(tensor) for tensor in outputs]
@@ -113,7 +103,7 @@ class TorchExecutor(BaseGraphExecutor, torch.nn.Module):
             ]. Defaults to 'cuda'.
         """
         self._default_quant_fn = PPQLinearQuantFunction
-        self._deployed = False
+        self._depolyed = False
         self._device = device
         self._executing_contenxt = TorchBackendContext(executing_device=self._device)
         super().__init__(graph)
@@ -184,8 +174,8 @@ class TorchExecutor(BaseGraphExecutor, torch.nn.Module):
         Raises:
             ValueError: [when target device is unacceptable]
         """
-        self._deployed = True
-        self._runnable_graph(GraphDeployCommand(device=self._device))
+        self._depolyed = True
+        self._runnable_graph(GraphDepolyCommand(device=self._device))
 
     def to(self, device: str):
         # just keep TorchExecutor behaving like torch.nn.Module
@@ -446,9 +436,9 @@ class TorchExecutor(BaseGraphExecutor, torch.nn.Module):
 
     def load_graph(self, graph: BaseGraph) -> dict:
         super().load_graph(graph)
-        self._deployed = False
+        self._depolyed = False
         self._runnable_graph = RunnableGraph(self._graph)
-        self._runnable_graph(GraphDeployCommand(device=self._device))
+        self._runnable_graph(GraphDepolyCommand(device=self._device))
 
     def quantize_function(self, input: torch.Tensor, config: TensorQuantizationConfig = None) -> torch.Tensor:
         if config is None: return self._default_quant_fn(input, config)

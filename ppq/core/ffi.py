@@ -7,7 +7,6 @@
 """
 
 import os
-import traceback
 
 import torch
 from torch.utils.cpp_extension import load
@@ -16,21 +15,18 @@ from torch.cuda import synchronize
 from .defs import ppq_warning
 
 ppq_warning('Compling CUDA Kernels. Please wait...')
-try:
-    __CUDA_EXTENTION__ = load(
-        name='PPQ_Cuda_Impls',
-        sources=[
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'csrc/cuda/export.cc'),
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'csrc/cuda/linear.cu'),
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'csrc/cuda/sort.cu'),
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'csrc/cuda/train.cu'),
-        ],
-        build_directory=os.path.join(os.path.dirname(os.path.dirname(__file__)), 'csrc/build/'),
-        with_cuda=True,
-        extra_cflags=['-O3'])
-except Exception as e:
-    raise SystemError('PPQ can not complie cuda extensions, please check your complier and system environment, '
-                      'or simply set ppq.core.config.USING_CUDA_KERNEL = False.')
+__CUDA_EXTENTION__ = load(
+    name='PPQ_Cuda_Impls',
+    sources=[
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'csrc/cuda/export.cc'),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'csrc/cuda/linear.cu'),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'csrc/cuda/sort.cu'),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'csrc/cuda/train.cu'),
+    ],
+    build_directory=os.path.join(os.path.dirname(os.path.dirname(__file__)), 'csrc/build/'),
+    with_cuda=True,
+    extra_cflags=['-O3']
+)
 
 # helper class for calling cuda methods.
 class CUDA:
@@ -61,14 +57,13 @@ class CUDA:
         offsets: torch.Tensor,
         minimum: int = -128,
         maximum: int = 127,
-        rounding: int = 0,
-        dropout: float = 0
+        rounding: int = 0
     ) -> torch.Tensor:
         if not tensor.is_contiguous(): tensor = tensor.contiguous()
         # if scale is too small, quantization might cause fp32 underflow.
         # if scale < 1e-7: raise ValueError('scale is too small.')
         return __CUDA_EXTENTION__.QuantizeTensor_LT(
-            tensor, scales, offsets, minimum, maximum, rounding, dropout)
+            tensor, scales, offsets, minimum, maximum, rounding)
 
     @ staticmethod
     def LinearQuantize_C(
@@ -79,11 +74,10 @@ class CUDA:
         minimum: int = -128,
         maximum: int = 127,
         rounding: int = 0,
-        dropout: float = 0,
     ) -> torch.Tensor:
         if not tensor.is_contiguous(): tensor = tensor.contiguous()
         return __CUDA_EXTENTION__.QuantizeTensor_LC(
-            tensor, scales, offsets, minimum, maximum, channel_axis, rounding, dropout)
+            tensor, scales, offsets, minimum, maximum, channel_axis, rounding)
         
     @ staticmethod
     def LinearQuantize_T_B(
@@ -92,14 +86,13 @@ class CUDA:
         scales: torch.Tensor,
         offsets: torch.Tensor,
         dy: torch.Tensor,
-        grad_factor: float,
         minimum: int,
         maximum: int
     ) -> torch.Tensor:
         if not tensor.is_contiguous(): tensor = tensor.contiguous()
         return __CUDA_EXTENTION__.QuantizeTensor_LT_B(
             tensor, quantized, scales, offsets, 
-            dy, grad_factor, minimum, maximum
+            dy, minimum, maximum
         )
 
     @ staticmethod
@@ -109,7 +102,6 @@ class CUDA:
         scales: torch.Tensor,
         offsets: torch.Tensor,
         dy: torch.Tensor,
-        grad_factor: float,
         minimum: int,
         maximum: int,
         channel_axis: int,
@@ -117,7 +109,7 @@ class CUDA:
         if not tensor.is_contiguous(): tensor = tensor.contiguous()
         return __CUDA_EXTENTION__.QuantizeTensor_LC_B(
             tensor, quantized, scales, offsets, 
-            dy, grad_factor, minimum, maximum, channel_axis
+            dy, minimum, maximum, channel_axis
         )
 
     @ staticmethod
@@ -129,18 +121,6 @@ class CUDA:
     ) -> torch.Tensor:
         # if scale < 1e-7: raise ValueError('scale is too small.')
         __CUDA_EXTENTION__.Histogram_T(tensor, scale, clip_outliers, histogram)
-        return histogram
-
-    @ staticmethod
-    def Histogram_C(
-        tensor: torch.Tensor,
-        channel_axis: int,
-        histogram: torch.Tensor,
-        scale: float,
-        clip_outliers: bool = True
-    ) -> torch.Tensor:
-        # if scale < 1e-7: raise ValueError('scale is too small.')
-        __CUDA_EXTENTION__.Histogram_C(tensor, channel_axis, scale, clip_outliers, histogram)
         return histogram
 
     @ staticmethod

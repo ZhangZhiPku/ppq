@@ -2,12 +2,11 @@ from collections import defaultdict
 from typing import Iterable, List
 
 import torch
-from ppq.core import (COMPELING_OP_TYPES, LINEAR_ACTIVATIONS,
-                      ORT_OOS_FUSE_START_OPS, PPLCUDA_ACTIVATIONS,
+from ppq.core import (COMPELING_OP_TYPES, PPLCUDA_ACTIVATIONS,
                       QuantizationProperty, QuantizationStates, RoundingPolicy,
-                      TargetPlatform, TensorQuantizationConfig,
-                      empty_ppq_cache)
-from ppq.core.defs import ppq_warning
+                      TargetPlatform, empty_ppq_cache)
+from ppq.core.common import LINEAR_ACTIVATIONS
+from ppq.core.quant import TensorQuantizationConfig
 from ppq.executor import BaseGraphExecutor
 from ppq.IR import GraphCommandProcesser, QuantableOperation, Variable
 from ppq.IR.base.graph import Operation
@@ -20,14 +19,14 @@ from .base import QuantizationOptimizationPass
 
 class QuantizeReducePass(QuantizationOptimizationPass):
     """
-        QuantizeReducePass 用来简化量化定点信息:通常每一个 Quantable 算子都有前后两个定点信息，
+        QuantizeReducePass 用来简化量化定点信息：通常每一个 Quantable 算子都有前后两个定点信息，
         而运算时通常可以屏蔽一半定点信息以加速。QuantizeReducePass 被设计用来找出可以屏蔽的定点信息。
 
         对于两个相邻算子(op_1 -> op_2)而言，将会出现以下几种情况
             1. op_1 与 op_2 均不量化，此时无需对数据流进行额外处理
             2. op_1 量化，op_2 不量化，op_1 需要对结果进行量化
             3. op_1 不量化，op_2 量化，此时需要按 op_2 的量化参数对数据流进行量化
-            4. op_1 与 op_2 均量化，此时分情况讨论:
+            4. op_1 与 op_2 均量化，此时分情况讨论：
                 4.1. op_1 量化位宽高于 op_2，此时按 op_2 的量化参数对数据流进行量化
                 4.2. op_1 量化位宽低于 op_2，此时按 op_1 的量化参数对数据流进行量化
                 4.3. op_1 量化位等于 op_2，此时按 op_1 的量化参数对数据流进行量化
@@ -39,7 +38,7 @@ class QuantizeReducePass(QuantizationOptimizationPass):
             op_1 如果有定点信息，则必须对数据流进行量化
             op_2, op_3 则需要分别确认是否需要再次对输入数据执行再次量化
 
-        总结:
+        总结：
             当 下游节点 的量化位宽大于等于 上游节点 时，按 上游节点 的量化信息执行量化，此时量化操作发生在上游
             当 下游节点 的量化位宽小于 上游节点 时，按 下游节点 的量化信息执行量化，此时量化操作发生在下游（上游量化未必可以省略）
         
@@ -360,9 +359,11 @@ class QuantizeFusionPass(QuantizationOptimizationPass):
             act_ops = []
             for op in graph.operations.values():
                 if not isinstance(op, QuantableOperation): continue
-                if op.type in LINEAR_ACTIVATIONS: act_ops.append(op)
+                if op.type in LINEAR_ACTIVATIONS:
+                    act_ops.append(op)
                 elif self.platform == TargetPlatform.PPL_CUDA_INT8:
-                    if op.type in PPLCUDA_ACTIVATIONS: act_ops.append(op)
+                    if op.type in PPLCUDA_ACTIVATIONS:
+                        act_ops.append(op)
                 else: continue
 
             # fusion
@@ -372,9 +373,6 @@ class QuantizeFusionPass(QuantizationOptimizationPass):
                 assert len(upstream_ops) == 1, 'Oops, we got some problem here.'
                 
                 upstream_op = upstream_ops[0]
-                if self.platform == TargetPlatform.ORT_OOS_INT8:
-                    if not upstream_op.type in ORT_OOS_FUSE_START_OPS: continue
-
                 if (isinstance(upstream_op, QuantableOperation) and 
                     len(graph.get_downstream_operations(upstream_op)) == 1 and 
                     upstream_op.platform == op.platform):
@@ -551,8 +549,8 @@ class QuantAlignmentPass(QuantizationOptimizationPass):
         device = master_config.scale.device
         master_config._father_config = master_config
         master_config.state  = QuantizationStates.ACTIVATED
-        master_config.scale  = torch.tensor(scale, dtype=torch.float32, device=device)
-        master_config.offset = torch.tensor(offset, dtype=torch.float32, device=device)
+        master_config.scale  = torch.tensor([scale], dtype=torch.float32, device=device)
+        master_config.offset = torch.tensor([offset], dtype=torch.float32, device=device)
 
         for slave_config in op.config.input_quantization_config[1: ]:
             slave_config.set_master(master=master_config)
@@ -602,82 +600,3 @@ class QuantAlignmentPass(QuantizationOptimizationPass):
                         for cfg, var in up_op.config_with_variable:
                             if operation in var.dest_ops: 
                                 cfg.set_master(master=master_config, recursive=False)
-
-
-class SwishFusionPass(QuantizationOptimizationPass):
-    def __init__(self) -> None:
-        super().__init__('Swish Fusion')
-        
-    def optimize(self, processer: GraphCommandProcesser, 
-                 dataloader: Iterable, executor: BaseGraphExecutor, **kwargs) -> None:
-        graph = processer.graph
-        search_engine = SearchableGraph(graph)
-        patterns = search_engine.pattern_matching(
-            patterns = [lambda x: x.is_computing_op, 'Sigmoid', 'Mul'],
-            edges = [[0, 1], [1, 2], [0, 2]],
-            exclusive = True)
-
-        for pattern in patterns:
-            if any([not isinstance(op, QuantableOperation) for op in pattern]): 
-                ppq_warning(f'There is a pattern of swish activation in your network start from {pattern[0]}, '
-                            'however part of your swish activation is not quantable, '
-                            'so that graph fusion can not merge their quantization configuration.')
-                continue
-            if any([op.platform != pattern[0].platform for op in pattern]):
-                ppq_warning(f'There is a pattern of swish activation in your network start from {pattern[0]}, '
-                            'however part of your swish activation is not quantable, '
-                            'so that graph fusion can not merge their quantization configuration.')
-                continue
-            computing, sigmoid, mul = pattern
-            
-            assert isinstance(computing, QuantableOperation)
-            assert isinstance(sigmoid, QuantableOperation)
-            assert isinstance(mul, QuantableOperation)
-            
-            master_config = mul.config.output_quantization_config[0]
-            computing.config.output_quantization_config[0].dominated_by = master_config
-            sigmoid.config.input_quantization_config[0].dominated_by    = master_config
-            sigmoid.config.output_quantization_config[0].dominated_by   = master_config
-            mul.config.input_quantization_config[0].dominated_by        = master_config
-            mul.config.input_quantization_config[1].dominated_by        = master_config
-
-
-class MishFusionPass(QuantizationOptimizationPass):
-    def __init__(self) -> None:
-        super().__init__('Mish Fusion')
-
-    def optimize(self, processer: GraphCommandProcesser, 
-                 dataloader: Iterable, executor: BaseGraphExecutor, **kwargs) -> None:
-        graph = processer.graph
-        search_engine = SearchableGraph(graph)
-        patterns = search_engine.pattern_matching(
-            patterns = [lambda x: x.is_computing_op, 'Softplus', 'Tanh', 'Mul'],
-            edges = [[0, 1], [1, 2], [2, 3], [0, 3]],
-            exclusive = True)
-
-        for pattern in patterns:
-            if any([not isinstance(op, QuantableOperation) for op in pattern]): 
-                ppq_warning(f'There is a pattern of mish activation in your network start from {pattern[0]}, '
-                            'however part of your mish activation is not quantable, '
-                            'so that graph fusion can not merge their quantization configuration.')
-                continue
-            if any([op.platform != pattern[0].platform for op in pattern]):
-                ppq_warning(f'There is a pattern of mish activation in your network start from {pattern[0]}, '
-                            'however part of your mish activation is not quantable, '
-                            'so that graph fusion can not merge their quantization configuration.')
-                continue
-            computing, softplus, tanh, mul = pattern
-            
-            assert isinstance(computing, QuantableOperation)
-            assert isinstance(softplus, QuantableOperation)
-            assert isinstance(tanh, QuantableOperation)
-            assert isinstance(mul, QuantableOperation)
-            
-            master_config = mul.config.output_quantization_config[0]
-            computing.config.output_quantization_config[0].dominated_by = master_config
-            tanh.config.input_quantization_config[0].dominated_by       = master_config
-            tanh.config.output_quantization_config[0].dominated_by      = master_config
-            softplus.config.input_quantization_config[0].dominated_by   = master_config
-            softplus.config.output_quantization_config[0].dominated_by  = master_config
-            mul.config.input_quantization_config[0].dominated_by        = master_config
-            mul.config.input_quantization_config[1].dominated_by        = master_config
