@@ -10,8 +10,12 @@ from ppq.IR import (BaseGraph, GraphCommand, GraphCommandType, GraphFormatter,
 from ppq.IR.morph import GraphDeviceSwitcher
 from ppq.parser import dump_graph_to_file, load_graph
 from ppq.quantization.quantizer import (BaseQuantizer, ExtQuantizer,
-                                        NXP_Quantizer, PPL_DSP_Quantizer,
-                                        PPLCUDAQuantizer, TensorRTQuantizer)
+                                        NXP_Quantizer,
+                                        ORT_PerTensorQuantizer, ORT_PerChannelQuantizer,
+                                        PPL_DSP_Quantizer, PPLCUDA_INT4_Quantizer,
+                                        PPLCUDAMixPrecisionQuantizer, ACADEMIC_INT4_Quantizer,
+                                        PPLCUDAQuantizer, TensorRTQuantizer, ACADEMICQuantizer,
+                                        ACADEMIC_Mix_Quantizer)
 from ppq.scheduler import DISPATCHER_TABLE
 from torch.utils.data import DataLoader
 
@@ -21,8 +25,15 @@ QUANTIZER_COLLECTION = {
     TargetPlatform.DSP_INT8: PPL_DSP_Quantizer,
     TargetPlatform.TRT_INT8: TensorRTQuantizer,
     TargetPlatform.NXP_INT8: NXP_Quantizer,
+    TargetPlatform.ORT_OOS_INT8: ORT_PerTensorQuantizer,
+    # TargetPlatform.ORT_OOS_INT8: ORT_PerChannelQuantizer,
     TargetPlatform.PPL_CUDA_INT8: PPLCUDAQuantizer,
-    TargetPlatform.EXTENSION: ExtQuantizer
+    TargetPlatform.EXTENSION: ExtQuantizer,
+    TargetPlatform.PPL_CUDA_MIX: PPLCUDAMixPrecisionQuantizer,
+    TargetPlatform.PPL_CUDA_INT4: PPLCUDA_INT4_Quantizer,
+    TargetPlatform.ACADEMIC_INT8: ACADEMICQuantizer,
+    TargetPlatform.ACADEMIC_INT4: ACADEMIC_INT4_Quantizer,
+    TargetPlatform.ACADEMIC_MIX: ACADEMIC_Mix_Quantizer
 }
 
 def load_onnx_graph(onnx_import_file: str, setting: QuantizationSetting) -> BaseGraph:
@@ -85,6 +96,8 @@ def dump_torch_to_onnx(
     """
 
     # set model to eval mode, stablize normalization weights.
+    assert isinstance(model, torch.nn.Module), (
+        f'Model must be instance of torch.nn.Module, however {type(model)} is given.')
     model.eval()
 
     if inputs is None:

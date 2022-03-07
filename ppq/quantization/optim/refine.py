@@ -2,11 +2,11 @@ from collections import defaultdict
 from typing import Iterable, List
 
 import torch
-from ppq.core import (COMPELING_OP_TYPES, PPLCUDA_ACTIVATIONS,
+from ppq.core import (COMPELING_OP_TYPES, LINEAR_ACTIVATIONS,
+                      ORT_OOS_FUSE_START_OPS, PPLCUDA_ACTIVATIONS,
                       QuantizationProperty, QuantizationStates, RoundingPolicy,
-                      TargetPlatform, empty_ppq_cache)
-from ppq.core.common import LINEAR_ACTIVATIONS
-from ppq.core.quant import TensorQuantizationConfig
+                      TargetPlatform, TensorQuantizationConfig,
+                      empty_ppq_cache)
 from ppq.executor import BaseGraphExecutor
 from ppq.IR import GraphCommandProcesser, QuantableOperation, Variable
 from ppq.IR.base.graph import Operation
@@ -359,11 +359,9 @@ class QuantizeFusionPass(QuantizationOptimizationPass):
             act_ops = []
             for op in graph.operations.values():
                 if not isinstance(op, QuantableOperation): continue
-                if op.type in LINEAR_ACTIVATIONS:
-                    act_ops.append(op)
+                if op.type in LINEAR_ACTIVATIONS: act_ops.append(op)
                 elif self.platform == TargetPlatform.PPL_CUDA_INT8:
-                    if op.type in PPLCUDA_ACTIVATIONS:
-                        act_ops.append(op)
+                    if op.type in PPLCUDA_ACTIVATIONS: act_ops.append(op)
                 else: continue
 
             # fusion
@@ -373,6 +371,9 @@ class QuantizeFusionPass(QuantizationOptimizationPass):
                 assert len(upstream_ops) == 1, 'Oops, we got some problem here.'
                 
                 upstream_op = upstream_ops[0]
+                if self.platform == TargetPlatform.ORT_OOS_INT8:
+                    if not upstream_op.type in ORT_OOS_FUSE_START_OPS: continue
+
                 if (isinstance(upstream_op, QuantableOperation) and 
                     len(graph.get_downstream_operations(upstream_op)) == 1 and 
                     upstream_op.platform == op.platform):
