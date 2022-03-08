@@ -508,8 +508,12 @@ class PriorityQueue:
         self._data = []
         self._ops  = set()
         self._idx  = 0
+        self._lazy_tag = True # 延迟操作标志
     
     def pop(self) -> Tuple[int, Operation]:
+        if not self._lazy_tag: 
+            self._data = sorted(self._data, key=lambda x: x[0])
+            self._lazy_tag = True
         if self._idx >= len(self._data): raise IndexError('Index out of range!')
         ele = self._data[self._idx]
         self._idx += 1
@@ -518,8 +522,8 @@ class PriorityQueue:
     def push(self, depth: int, op: Operation):
         if op in self._ops: return
         self._data.append((depth, op))
-        self._data = sorted(self._data, key=lambda x: x[0])
         self._ops.add(op)
+        self._lazy_tag = False
     
     def empty(self) -> bool:
         return self._idx >= len(self._data)
@@ -600,7 +604,7 @@ class BlockBuilder:
         建立所有Block所需时间 O(nkd)
         """
         def _find_multi_input_ep(op: Operation):
-            # 层序遍历寻找阻断节点
+            # 如果当前节点后继节点存在多个，层序遍历寻找阻断节点
             least_first_queue = PriorityQueue()
             
             for down_op in self.graph.get_downstream_operations(op):
@@ -616,6 +620,7 @@ class BlockBuilder:
             return None
 
         def _find_coherent_ep(op: Operation):
+            # 如果当前节点后继节点只有一个，向下寻找直系节点
             ops = self.graph.get_downstream_operations(op)
             if len(ops) == 1 and len(self.graph.get_upstream_operations(ops[0])) == 1: 
                 return ops[0]

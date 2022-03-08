@@ -1,16 +1,13 @@
 import json
-from typing import Union
 
-import numpy as np
-import torch
 from ppq.core import (DataType, QuantizationProperty, QuantizationStates,
-                      TargetPlatform, TensorQuantizationConfig,
-                      convert_any_to_numpy)
+                      TargetPlatform, TensorQuantizationConfig)
 from ppq.IR import BaseGraph
 from ppq.IR.quantize import QuantableOperation
 
 from .onnx_exporter import OnnxExporter
 from .util import convert_value
+
 
 def convert_type(platform: TargetPlatform) -> str:
     if platform == TargetPlatform.PPL_CUDA_INT8: return "INT8"

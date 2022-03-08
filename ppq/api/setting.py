@@ -452,6 +452,13 @@ class QuantizationSettingFactory:
         return default_setting
 
     @ staticmethod
+    def metax_pertensor_setting() -> QuantizationSetting:
+        default_setting = QuantizationSetting()
+        default_setting.equalization = True
+        default_setting.fusion_setting.fuse_conv_add = False
+        return default_setting
+
+    @ staticmethod
     def dsp_setting() -> QuantizationSetting:
         default_setting = QuantizationSetting()
         default_setting.equalization = True

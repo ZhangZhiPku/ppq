@@ -3,10 +3,11 @@ from math import ceil
 from typing import Iterable, List
 
 import torch
-from ppq.core import (QuantizationProperty, QuantizationStates, TensorMeta,
-                      empty_ppq_cache, ppq_warning)
+from ppq.core import (QuantizationStates, TensorMeta, empty_ppq_cache,
+                      ppq_warning)
 from ppq.executor import BaseGraphExecutor
 from ppq.IR import BaseGraph, GraphCommandProcesser, Operation, Variable
+from ppq.IR.morph import GraphReplacer
 from ppq.IR.quantize import QuantableOperation
 from ppq.IR.search import Path, SearchableGraph
 from ppq.quantization.observer import TensorObserverFactroy
@@ -462,3 +463,54 @@ class ChannelSplitPass(QuantizationOptimizationPass):
             self.modify_meta(path, len(copy_channels))
             self.store_parameter(path)
             self.initiate_path_state(path)
+
+
+class MetaxGemmSplitPass(QuantizationOptimizationPass):
+    """
+    Metax 不支持 Gemm 的量化，这个 pass 将 Gemm 拆分成 
+    
+        --- Matmul -----|
+                        + --- Add ---
+            bias   -----|
+    
+    """
+    def __init__(self, name: str = 'Metax Gemm Split Pass') -> None:
+        super().__init__(name)
+    
+    def optimize(self, processer: GraphCommandProcesser, 
+                 dataloader: Iterable, executor: BaseGraphExecutor, **kwargs) -> None:
+        morpher = GraphReplacer(processer)
+        interested_ops = []
+        for operation in processer.graph.operations.values():
+            if operation.type == 'Gemm':
+                interested_ops.append(operation)
+
+        for op in interested_ops:
+            assert isinstance(op, Operation)
+            if op.num_of_input == 2: # no bias gemm
+                inserting_matmul = Operation(name=f'{op.name}', op_type='Gemm')
+                morpher.replace_op(op_name=op.name, replace_to=inserting_matmul)
+            elif op.num_of_input == 3:
+                inserting_add      = Operation(name=f'{op.name}', op_type='Add', attributes={})
+                inserting_matmul   = Operation(name=f'{op.name}_matmul', op_type='MatMul', attributes={})
+                morpher.replace_op(op_name=op.name, replace_to=inserting_add)
+
+                # process with matmul
+                weight_var = op.inputs[1]
+                inserting_add.inputs.remove(weight_var)
+                upstream_op = morpher.graph.get_upstream_operations(inserting_add)
+                assert len(upstream_op) == 1, 'Gemm is expected to have at most 1 income op.'
+                upstream_op = upstream_op[0]
+                
+                morpher.graph.insert_op_between_ops(inserting_op=inserting_matmul, up_op=upstream_op, down_op=inserting_add)
+                op.inputs.remove(weight_var)
+                inserting_matmul.inputs.append(weight_var)
+                weight_var.dest_ops.clear()
+                weight_var.dest_ops.append(inserting_matmul)
+            else: raise ValueError(f'Operation {op.name} should contains 2-3 input, however {op.num_of_input} was given.')
+            
+            if op.attributes.get('transA') == 1:
+                raise ValueError(f'Can not process with operation {op.name}, transA=1 is not allowed.')
+            if op.attributes.get('transB') == 1:
+                inserting_matmul.inputs[-1].value = torch.permute(inserting_matmul.inputs[-1].value, (1, 0))
+            

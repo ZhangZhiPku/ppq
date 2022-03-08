@@ -19,14 +19,14 @@ from .base import QuantizationOptimizationPass
 
 class QuantizeReducePass(QuantizationOptimizationPass):
     """
-        QuantizeReducePass 用来简化量化定点信息：通常每一个 Quantable 算子都有前后两个定点信息，
+        QuantizeReducePass 用来简化量化定点信息:通常每一个 Quantable 算子都有前后两个定点信息，
         而运算时通常可以屏蔽一半定点信息以加速。QuantizeReducePass 被设计用来找出可以屏蔽的定点信息。
 
         对于两个相邻算子(op_1 -> op_2)而言，将会出现以下几种情况
             1. op_1 与 op_2 均不量化，此时无需对数据流进行额外处理
             2. op_1 量化，op_2 不量化，op_1 需要对结果进行量化
             3. op_1 不量化，op_2 量化，此时需要按 op_2 的量化参数对数据流进行量化
-            4. op_1 与 op_2 均量化，此时分情况讨论：
+            4. op_1 与 op_2 均量化，此时分情况讨论:
                 4.1. op_1 量化位宽高于 op_2，此时按 op_2 的量化参数对数据流进行量化
                 4.2. op_1 量化位宽低于 op_2，此时按 op_1 的量化参数对数据流进行量化
                 4.3. op_1 量化位等于 op_2，此时按 op_1 的量化参数对数据流进行量化
@@ -38,7 +38,7 @@ class QuantizeReducePass(QuantizationOptimizationPass):
             op_1 如果有定点信息，则必须对数据流进行量化
             op_2, op_3 则需要分别确认是否需要再次对输入数据执行再次量化
 
-        总结：
+        总结:
             当 下游节点 的量化位宽大于等于 上游节点 时，按 上游节点 的量化信息执行量化，此时量化操作发生在上游
             当 下游节点 的量化位宽小于 上游节点 时，按 下游节点 的量化信息执行量化，此时量化操作发生在下游（上游量化未必可以省略）
         

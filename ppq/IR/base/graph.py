@@ -345,7 +345,6 @@ class BaseGraph(Serializable):
         return upstream_ops
     
     def topological_sort(self) -> List[Operation]:
-
         visited = {operation.name: False for operation in self.operations.values()}
         sort_ret, pop_list = [], deque()
         num_of_inputs = {
