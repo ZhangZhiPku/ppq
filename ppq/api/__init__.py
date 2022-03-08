@@ -9,13 +9,18 @@ from ppq.IR import (BaseGraph, GraphCommand, GraphCommandType, GraphFormatter,
                     GraphMerger)
 from ppq.IR.morph import GraphDeviceSwitcher
 from ppq.parser import dump_graph_to_file, load_graph
-from ppq.quantization.quantizer import (BaseQuantizer, ExtQuantizer,
-                                        NXP_Quantizer,
-                                        ORT_PerTensorQuantizer, ORT_PerChannelQuantizer,
-                                        PPL_DSP_Quantizer, PPLCUDA_INT4_Quantizer,
-                                        PPLCUDAMixPrecisionQuantizer, ACADEMIC_INT4_Quantizer,
-                                        PPLCUDAQuantizer, TensorRTQuantizer, ACADEMICQuantizer,
-                                        ACADEMIC_Mix_Quantizer)
+from ppq.quantization.quantizer import (ACADEMIC_INT4_Quantizer,
+                                        ACADEMIC_Mix_Quantizer,
+                                        ACADEMICQuantizer, BaseQuantizer,
+                                        ExtQuantizer,
+                                        MetaxChannelwiseQuantizer,
+                                        MetaxTensorwiseQuantizer,
+                                        NXP_Quantizer, ORT_PerChannelQuantizer,
+                                        ORT_PerTensorQuantizer,
+                                        PPL_DSP_Quantizer,
+                                        PPLCUDA_INT4_Quantizer,
+                                        PPLCUDAMixPrecisionQuantizer,
+                                        PPLCUDAQuantizer, TensorRTQuantizer)
 from ppq.scheduler import DISPATCHER_TABLE
 from torch.utils.data import DataLoader
 
@@ -26,6 +31,8 @@ QUANTIZER_COLLECTION = {
     TargetPlatform.TRT_INT8: TensorRTQuantizer,
     TargetPlatform.NXP_INT8: NXP_Quantizer,
     TargetPlatform.ORT_OOS_INT8: ORT_PerTensorQuantizer,
+    TargetPlatform.METAX_INT8_C: MetaxChannelwiseQuantizer,
+    TargetPlatform.METAX_INT8_T: MetaxTensorwiseQuantizer,
     # TargetPlatform.ORT_OOS_INT8: ORT_PerChannelQuantizer,
     TargetPlatform.PPL_CUDA_INT8: PPLCUDAQuantizer,
     TargetPlatform.EXTENSION: ExtQuantizer,

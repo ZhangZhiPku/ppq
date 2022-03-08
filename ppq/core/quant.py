@@ -63,15 +63,18 @@ class TargetPlatform(Enum):
 
     DSP_INT8  = 301
 
-    HOST_INT8 = 402
+    HOST_INT8 = 401
 
     NXP_INT8  = 501
-    
+
     ORT_OOS_INT8 = 601
 
-    ACADEMIC_INT8 = 701
-    ACADEMIC_INT4 = 702
-    ACADEMIC_MIX  = 703
+    METAX_INT8_C = 701 # channel wise
+    METAX_INT8_T = 702 # tensor wise
+
+    ACADEMIC_INT8 = 801
+    ACADEMIC_INT4 = 802
+    ACADEMIC_MIX  = 803
 
     FP32 = 0
     # SHAPE-OR-INDEX related operation
@@ -88,13 +91,12 @@ class TargetPlatform(Enum):
     # THIS IS A DUUMY PLATFORM JUST FOR CREATING YOUR OWN EXTENSTION.
     EXTENSION     = -10086
     
-
     @ classmethod
     def is_quantized_platform(cls, platform) -> bool:
         return platform in {
             cls.DSP_INT8, cls.TRT_INT4, cls.TRT_INT8, cls.NXP_INT8, 
             cls.PPL_CUDA_INT8, cls.PPL_CUDA_INT4, cls.EXTENSION, cls.PPL_CUDA_MIX, cls.ORT_OOS_INT8,
-            cls.ACADEMIC_INT4, cls.ACADEMIC_INT8, cls.ACADEMIC_MIX}
+            cls.ACADEMIC_INT4, cls.ACADEMIC_INT8, cls.ACADEMIC_MIX, cls.METAX_INT8_C, cls.METAX_INT8_T}
 
 
 class RoundingPolicy(Enum):
@@ -475,6 +477,7 @@ class TensorQuantizationConfig(Serializable):
         assert isinstance(o, TensorQuantizationConfig), (
             'Can only set this attribute with another tensor config.')
         root, dominator = self.dominated_by, o.dominated_by
+        assert isinstance(root, TensorQuantizationConfig)
         if dominator != root:
             root._father_config = dominator
             self._father_config = dominator
@@ -484,7 +487,7 @@ class TensorQuantizationConfig(Serializable):
     def set_master(self, master, recursive: bool = False):
         assert isinstance(master, TensorQuantizationConfig), (
             'Can only set this attribute with another tensor config.')
-        assert master.state in {QuantizationStates.ACTIVATED, QuantizationStates.SLAVE}, (
+        assert master.state in {QuantizationStates.ACTIVATED, QuantizationStates.OVERLAPPED, QuantizationStates.SLAVE}, (
             f'Quantization State of master must be ACTIVATED or SLAVE, however {master.state.name} was given.')
         if recursive:
             root = self.dominated_by

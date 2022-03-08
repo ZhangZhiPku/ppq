@@ -210,8 +210,8 @@ class ONNXRUNTIMExporter(OnnxExporter):
             upstream_op = graph.get_upstream_operations(op)[0]
             if not isinstance(upstream_op, QuantableOperation): continue
             input_var, input_cfg = op.inputs[0], op.config.input_quantization_config[0]
-            if input_cfg.policy.has_property(QuantizationProperty.ASYMMETRICAL): continue
-            
+            if not input_cfg.policy.has_property(QuantizationProperty.ASYMMETRICAL): continue
+
             # PATCH 20220304 Removing graph output op might cause error.
             if op.outputs[0].name in graph.outputs:
                 graph.outputs.pop(op.outputs[0].name)
@@ -226,28 +226,6 @@ class ONNXRUNTIMExporter(OnnxExporter):
             graph.remove_operation(op)
         formater = GraphFormatter(graph)
         formater(GraphCommand(GraphCommandType.DELETE_ISOLATED))
-        '''
-        for op in activation_ops:
-            if not isinstance(op, QuantableOperation): continue
-            input_variable = op.inputs[0]
-            assert isinstance(input_variable, QuantableVariable)
-            cfg = input_variable.source_op_config
-            if cfg is None: continue # upstream operation is not a QuantableOperation
-            
-            if not cfg.policy.has_property(QuantizationProperty.ASYMMETRICAL):
-                continue
-            if len(op.inputs) <= 1:
-                graph.remove_operation(op)
-            else:
-                for var in op.inputs[1:]:
-                    var.dest_ops.clear()
-                    graph.delete_variable(var.name)
-                while len(op.inputs) > 1:
-                    op.inputs.pop()
-                graph.remove_operation(op)
-        formater = GraphFormatter(graph)
-        formater(GraphCommand(GraphCommandType.DELETE_ISOLATED))
-        '''
 
     def required_opsets(self) -> Dict[str, int]:
         extra_domain_versions = [

@@ -1,24 +1,29 @@
 from typing import Union
 
-from ppq.core import (PASSIVE_OPERATIONS, OperationQuantizationConfig, ChannelwiseTensorQuantizationConfig,
-                      QuantizationPolicy, QuantizationProperty,
-                      QuantizationStates, RoundingPolicy, TargetPlatform)
+import torch
+from ppq.api.setting import QuantizationSetting
+from ppq.core import (PASSIVE_OPERATIONS, ChannelwiseTensorQuantizationConfig,
+                      OperationQuantizationConfig, QuantizationPolicy,
+                      QuantizationProperty, QuantizationStates, RoundingPolicy,
+                      TargetPlatform)
+from ppq.executor.base import BaseGraphExecutor
 from ppq.IR import BaseGraph, GraphCommandProcesser
 from ppq.IR.base.graph import Operation
+from ppq.quantization.optim.base import QuantizationOptimizationPipeline
+from ppq.quantization.optim.morph import MetaxGemmSplitPass
 
 from .base import BaseQuantizer
 
-import torch
 
-class ORT_PerTensorQuantizer(BaseQuantizer):
+class MetaxTensorwiseQuantizer(BaseQuantizer):
     def __init__(
         self,
         graph: Union[BaseGraph, GraphCommandProcesser]
     ) -> Union[torch.Tensor, list, dict]:
 
         self._num_of_bits = 8
-        self._quant_min = 0
-        self._quant_max = int(pow(2, self._num_of_bits) - 1)
+        self._quant_min = -128
+        self._quant_max = 127
 
         super().__init__(graph=graph)
 
@@ -41,7 +46,7 @@ class ORT_PerTensorQuantizer(BaseQuantizer):
                 # however, it may cause a scale underflow
                 # here we give bias a 30 bits precision, which is pettery enough in all cases
                 bias_config.num_of_bits = 30
-                bias_config.quant_max = int(pow(2, 30 - 1) - 1)
+                bias_config.quant_max = int(pow(2, 30 - 1))
                 bias_config.quant_min = - int(pow(2, 30 - 1))
                 bias_config.policy = QuantizationPolicy(
                     QuantizationProperty.SYMMETRICAL +
@@ -58,7 +63,7 @@ class ORT_PerTensorQuantizer(BaseQuantizer):
 
     @ property
     def target_platform(self) -> TargetPlatform:
-        return TargetPlatform.ORT_OOS_INT8
+        return TargetPlatform.METAX_INT8_C
 
     @ property
     def default_platform(self) -> TargetPlatform:
@@ -67,31 +72,38 @@ class ORT_PerTensorQuantizer(BaseQuantizer):
     @ property
     def quant_operation_types(self) -> set:
         return {
-            'Conv', 'GlobalAveragePool', 'AveragePool',
-            'Relu', 'Add', 'Mul', 'Clip',
-            'MatMul'
-        }
+            'Conv', 'Relu', 'PRelu', 'Clip', 'Gemm',
+            'Resize', 'MaxPool', 'AveragePool', 
+            'GlobalMaxPool', 'GlobalAveragePool',
+            'Mul', 'Add', 'LeakyRelu', 'Split', 'Concat',
+            'Transpose', 'Slice', 'Reshape', 'Flatten', 
+            'MatMul'}
 
     @ property
     def quantize_policy(self) -> QuantizationPolicy:
         return QuantizationPolicy(
-            QuantizationProperty.ASYMMETRICAL +
+            QuantizationProperty.SYMMETRICAL +
             QuantizationProperty.LINEAR +
-            QuantizationProperty.PER_TENSOR
-        )
+            QuantizationProperty.PER_TENSOR)
 
     @ property
     def rounding_policy(self) -> RoundingPolicy:
         return RoundingPolicy.ROUND_HALF_EVEN
 
-class ORT_PerChannelQuantizer(BaseQuantizer):
+    def build_prequant_pipeline(
+        self, setting: QuantizationSetting, executor: BaseGraphExecutor) -> QuantizationOptimizationPipeline:
+        return super().build_prequant_pipeline(setting, executor).append_optimization_to_pipeline(
+            MetaxGemmSplitPass(), at_front=True)
+
+
+class MetaxChannelwiseQuantizer(BaseQuantizer):
     def __init__(
         self, graph: Union[BaseGraph, GraphCommandProcesser]
     ) -> Union[torch.Tensor, list, dict]:
 
         self._num_of_bits = 8
-        self._quant_min = 0
-        self._quant_max = int(pow(2, self._num_of_bits) - 1)
+        self._quant_min = -128
+        self._quant_max = 127
 
         super().__init__(graph=graph)
 
@@ -152,8 +164,8 @@ class ORT_PerChannelQuantizer(BaseQuantizer):
                     QuantizationProperty.PER_CHANNEL
                 )
                 bias_config.num_of_bits = 30
-                bias_config.quant_max = int(pow(2, bias_config.num_of_bits - 1)) - 1
-                bias_config.quant_min = - int(pow(2, bias_config.num_of_bits - 1)) + 1
+                bias_config.quant_max = int(pow(2, bias_config.num_of_bits - 1))
+                bias_config.quant_min = - int(pow(2, bias_config.num_of_bits - 1))
                 bias_config.state = QuantizationStates.PASSIVE_INIT
                 base_quant_config.input_quantization_config[-1] = \
                     ChannelwiseTensorQuantizationConfig.convert_from_tensor_config(
@@ -169,7 +181,7 @@ class ORT_PerChannelQuantizer(BaseQuantizer):
 
     @ property
     def target_platform(self) -> TargetPlatform:
-        return TargetPlatform.ORT_OOS_INT8
+        return TargetPlatform.METAX_INT8_C
 
     @ property
     def default_platform(self) -> TargetPlatform:
@@ -178,15 +190,17 @@ class ORT_PerChannelQuantizer(BaseQuantizer):
     @ property
     def quant_operation_types(self) -> set:
         return {
-            'Conv', 'GlobalAveragePool', 'AveragePool',
-            'Relu', 'Add', 'Mul', 'Clip',
-            'MatMul'
-        }
+            'Conv', 'Relu', 'PRelu', 'Clip', 'Gemm',
+            'Resize', 'MaxPool', 'AveragePool', 
+            'GlobalMaxPool', 'GlobalAveragePool',
+            'Mul', 'Add', 'LeakyRelu', 'Split', 'Concat',
+            'Transpose', 'Slice', 'Reshape', 'Flatten', 
+            'MatMul'}
 
     @ property
     def quantize_policy(self) -> QuantizationPolicy:
         return QuantizationPolicy(
-            QuantizationProperty.ASYMMETRICAL +
+            QuantizationProperty.SYMMETRICAL +
             QuantizationProperty.LINEAR +
             QuantizationProperty.PER_TENSOR
         )
@@ -194,3 +208,8 @@ class ORT_PerChannelQuantizer(BaseQuantizer):
     @ property
     def rounding_policy(self) -> RoundingPolicy:
         return RoundingPolicy.ROUND_HALF_EVEN
+
+    def build_prequant_pipeline(
+        self, setting: QuantizationSetting, executor: BaseGraphExecutor) -> QuantizationOptimizationPipeline:
+        return super().build_prequant_pipeline(setting, executor).append_optimization_to_pipeline(
+            MetaxGemmSplitPass(), at_front=True)

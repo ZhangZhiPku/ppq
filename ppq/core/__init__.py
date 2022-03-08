@@ -40,8 +40,13 @@
                                     7qj:                          ..              .     7QBr                            
                                   rP:                                                      bB                           
 
+Sensetime PPL Quant Tool(PPQ) is a neural network quantization tool for high-performance deep learning inference. 
+It includes necessary network parsers, quant-simulator and optimization algorithms.
 
-PPL Quantization Tool(PPQ) is a nerual network quantization tool
+Generally, a quantized neural network will run 4x faster with 75% less memory cost than its float version.
+However quantization is not always safe, sometime you will find there is a accurary drop from quantization.
+
+This tool is designed thus, for solving problems during quantization.
 
 PPQ.core contains most of PPQ internal abstractions(data structures).
     

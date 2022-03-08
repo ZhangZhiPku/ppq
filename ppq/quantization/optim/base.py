@@ -1,7 +1,6 @@
 import time
 from abc import ABCMeta, abstractmethod
 from typing import Container, Iterable, Iterator, List, Union
-from ppq.core.defs import ppq_info
 
 from ppq.executor import BaseGraphExecutor
 from ppq.IR import BaseGraph, DefaultGraphProcesser, GraphCommandProcesser
@@ -104,6 +103,7 @@ class QuantizationOptimizationPipeline(Container, Iterable):
             self._optimization_passes.append(optimization_pass)
         else:
             self._optimization_passes = [optimization_pass] + self._optimization_passes
+        return self
 
     def report(self) -> str:
         report = ''
