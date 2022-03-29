@@ -87,7 +87,8 @@ class GraphFormatter(GraphCommandProcesser):
             GraphCommandType.DELETE_ISOLATED,
             GraphCommandType.REPLACE_SUB,
             GraphCommandType.FORMAT_PARAMETERS,
-            GraphCommandType.FORMAT_CONSTANT_INPUT
+            GraphCommandType.FORMAT_CONSTANT_INPUT,
+            GraphCommandType.FORMAT_SLICE
         ]
 
     def process(self, command: GraphCommand) -> Any:
@@ -109,6 +110,8 @@ class GraphFormatter(GraphCommandProcesser):
             return self.format_parameter_variables()
         if command.command_type == GraphCommandType.FORMAT_CONSTANT_INPUT:
             return self.format_constant_input()
+        if command.command_type == GraphCommandType.FORMAT_SLICE:
+            return self.format_slice()
 
     def format_slice(self) -> None:
         """
@@ -122,7 +125,7 @@ class GraphFormatter(GraphCommandProcesser):
                         f'Invalid Slice Operation Format, Slice operation is expected to have axes, '
                         'starts and ends attributes with opset 1, '
                         f'however your operation {operation.name}, do not have completed attributes')
-                interested_ops.append(operation)
+                    interested_ops.append(operation)
 
         for slice in interested_ops:
             assert isinstance(slice, Operation)
