@@ -10,6 +10,8 @@ PPL Quantization Tool (PPQ) is a powerful offline neural network quantization to
 * 4 & 8 mix precision quantization (exprimental)
 * Matrix Factorization Pass (exprimental)
 
+<iframe src="//player.bilibili.com/player.html?aid=682632207&bvid=BV1WS4y1N7Kn&cid=562252925&page=1" scrolling="no" border="0" frameborder="no" framespacing="0" allowfullscreen="true"> </iframe>
+
 # Features
 
 * Quantable graph, an quantization-oriented network representation.
