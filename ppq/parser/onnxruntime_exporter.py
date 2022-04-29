@@ -120,7 +120,7 @@ class ONNXRUNTIMExporter(OnnxExporter):
         created.meta_data = dq_meta
         return created
 
-    def remove_activation_ops(self, graph: BaseGraph, activation_ops: List[Operation]) -> BaseGraph:
+    def remove_activation_ops(self, graph: BaseGraph) -> BaseGraph:
         """
         For Asymmetric Quantization Policy, Activations like Relu & Clip can be
             removed from your network safely. Their function can be replaced by
@@ -132,9 +132,17 @@ class ONNXRUNTIMExporter(OnnxExporter):
             graph (BaseGraph): Processing Graph
             activation_ops (List[Operation]): Removing activations.
         """
+        removed_activations = []
+        for op in graph.operations.values(): 
+            if not isinstance(op, QuantableOperation): continue
+            if op.type in {'Relu', 'Clip'}:
+                # Only ASYMMETRICAL quantized activations can be safely removed.
+                if op.config.input_quantization_config[0].policy.has_property(QuantizationProperty.ASYMMETRICAL):
+                    removed_activations.append(op)
+        
         # Activation op can only be relu and clip,
         # so it is safe to access op.inputs[0], op.outputs[0] as their input and output.
-        for op in activation_ops:
+        for op in removed_activations:
             if not isinstance(op, QuantableOperation): continue
             if len(graph.get_upstream_operations(op)) == 0: Continue
 
@@ -199,9 +207,7 @@ class ONNXRUNTIMExporter(OnnxExporter):
 
     @ property
     def required_opsets(self) -> Dict[str, int]:
-        extra_domain_versions = [
-            ("ai.onnx", 13),
-        ]
+        extra_domain_versions = [("ai.onnx", 13)]
         return dict(extra_domain_versions)
 
     def convert_operation_from_opset11_to_opset13(self, graph:BaseGraph) -> None:
@@ -226,6 +232,69 @@ class ONNXRUNTIMExporter(OnnxExporter):
                 graph.create_link_with_op(variable=var, upstream_op=None, downstream_op=op)
                 op.meta_data.input_metas.append(TensorMeta.parsing_from_torch_tensor(var.value, var.name))
 
+    def convert_operation(self, graph: BaseGraph, op: QuantableOperation, 
+                          process_activation: bool, process_parameter: bool, 
+                          quant_param_to_int: bool):
+        """
+        Convert an operation to onnx quant & dequant format by inserting necessary quant & dequant op around it.
+        There are 2 ways to represent quantized ONNX models:
+
+        Operator Oriented. All the quantized operators have their own ONNX definitions,
+            like QLinearConv, MatMulInteger and etc.
+        
+        Tensor Oriented, aka Quantize and DeQuantize (QDQ). 
+            This format uses DQ(Q(tensor)) to simulate the quantize and dequantize process, 
+            and QuantizeLinear and DeQuantizeLinear operators also carry the quantization parameters. 
+            
+        Quantization-Aware training (QAT) models converted from Tensorflow or exported from PyTorch.
+        
+        Quantized models converted from tflite and other framework.
+
+        Args:
+            graph (BaseGraph): PPQ IR
+            op (Operation): Converting op
+            process_activation (bool): Converting op's activation
+            process_parameter (bool): Converting op's parameter
+            quant_param_to_int (bool): Quant op's parameter to int8
+        """
+        # collect quantable vars, where we need to insert quant and dequant op
+        for config, var in op.config_with_variable:
+            meta = var.meta
+            if var.is_parameter: 
+                assert len(var.dest_ops) == 1, (
+                f'Can not export variable {var.name}, cause it has more than 1 destination operations. '
+                'PPQ require all parameters to have only 1 destination operation.')
+
+                if not process_parameter: continue
+                # override quantization state, so that we can export parameter correctly.
+                if config.state == QuantizationStates.BAKED:
+                    config.state = QuantizationStates.ACTIVATED
+                if config.state == QuantizationStates.PASSIVE_BAKED:
+                    config.state = QuantizationStates.PASSIVE
+
+                if QuantizationStates.is_activated(config.state):
+                    # if not quant parameter to int, all parameter should export as fp32.
+                    # needs insert both quant and dequant op for them
+                    if not quant_param_to_int:
+                        created = self.insert_quant_on_variable(
+                            graph=graph, var=var, config=config, related_op=op, meta=meta)
+                        var = created.outputs[0]
+                    
+                    self.insert_dequant_on_variable(
+                        graph=graph, var=var, config=config, related_op=op, meta=meta)
+                    if quant_param_to_int:
+                        var.value = PPQLinearQuant_toInt(tensor=var.value, config=config)
+            
+            else: 
+                if not process_activation: continue
+
+                if QuantizationStates.is_activated(config.state):
+                    created = self.insert_quant_on_variable(
+                        graph=graph, var=var, config=config, related_op=op, meta=meta)
+                    var = created.outputs[0]
+                    self.insert_dequant_on_variable(
+                        graph=graph, var=var, config=config, related_op=op, meta=meta)
+
     def prepare_graph(
         self, graph: BaseGraph, 
         process_activation: bool = True, 
@@ -239,9 +308,9 @@ class ONNXRUNTIMExporter(OnnxExporter):
 
             1. Insert Quant and Dequant operation within your graph.
             
-            2. Quantize all parameters of your graph, convert them to int8.
+            2. Remove all unnecessary activations.
             
-            3. Remove all unnecessary activations.
+            3. Quantize all parameters of your graph, convert them to int8.
 
         Args:
             graph (BaseGraph): Processing Graph
@@ -255,57 +324,20 @@ class ONNXRUNTIMExporter(OnnxExporter):
         if not EXPORT_DEVICE_SWITCHER:
             processer = GraphDeviceSwitcher(graph)
             processer.remove_switcher()
+        
+        # remove activations
+        if remove_activation_fn:
+            # remove useless activation.
+            self.remove_activation_ops(graph)
 
         # mark quantable variables
         for op in [op for op in graph.operations.values()]:
             if not isinstance(op, QuantableOperation): continue
-            # collect quantable vars, where we need to insert quant and dequant op
-            for config, var in op.config_with_variable:
-                meta = var.meta
-                if var.is_parameter: 
-                    assert len(var.dest_ops) == 1, (
-                    f'Can not export variable {var.name}, cause it has more than 1 destination operations. '
-                    'PPQ require all parameters to have only 1 destination operation.')
-
-                    if not process_parameter: continue
-                    # override quantization state, so that we can export parameter correctly.
-                    if config.state == QuantizationStates.BAKED:
-                        config.state = QuantizationStates.ACTIVATED
-                    
-                    if QuantizationStates.is_activated(config.state):
-                        # if not quant parameter to int, all parameter should export as fp32.
-                        # needs insert both quant and dequant op for them
-                        if not quant_parameter_to_int:
-                            created = self.insert_quant_on_variable(
-                                graph=graph, var=var, config=config, related_op=op, meta=meta)
-                            var = created.outputs[0]
-                        
-                        self.insert_dequant_on_variable(
-                            graph=graph, var=var, config=config, related_op=op, meta=meta)
-                        if quant_parameter_to_int:
-                            var.value = PPQLinearQuant_toInt(tensor=var.value, config=config)
-                
-                else: 
-                    if not process_activation: continue
-
-                    if QuantizationStates.is_activated(config.state):
-                        created = self.insert_quant_on_variable(
-                            graph=graph, var=var, config=config, related_op=op, meta=meta)
-                        var = created.outputs[0]
-                        self.insert_dequant_on_variable(
-                            graph=graph, var=var, config=config, related_op=op, meta=meta)
-
-        if remove_activation_fn:
-            removed_activations = []
-            for op in graph.operations.values(): 
-                if not isinstance(op, QuantableOperation): continue
-                if op.type in {'Relu', 'Clip'}:
-                    # Only ASYMMETRICAL quantized activations can be safely removed.
-                    if op.config.input_quantization_config[0].policy.has_property(QuantizationProperty.ASYMMETRICAL):
-                        removed_activations.append(op)
-
-            # remove useless activation.
-            self.remove_activation_ops(graph, removed_activations)
+            self.convert_operation(
+                graph=graph, op=op, 
+                process_activation=process_activation, 
+                process_parameter=process_parameter, 
+                quant_param_to_int=quant_parameter_to_int)
 
         return self.remove_duplicated_quant_op(graph)
 

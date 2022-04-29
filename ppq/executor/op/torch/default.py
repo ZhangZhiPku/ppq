@@ -1460,15 +1460,14 @@ def Gemm_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendCon
         # reshape A from [n, c, h, w] to [n, chw]
         A = A.reshape(A.shape[0], -1)
     C = values[2] if len(values) > 2 else 0
-    alpha = op.attributes.get('alpha', 1.0)
-    beta = op.attributes.get('beta', 1.0)
+    alpha  = op.attributes.get('alpha', 1.0)
+    beta   = op.attributes.get('beta', 1.0)
     transA = op.attributes.get('transA', 0)
     transB = op.attributes.get('transB', 0)
     A = A.transpose(0, 1) if transA else A
     B = B.transpose(0, 1) if transB else B
 
     output = alpha * torch.matmul(A, B) + beta * C
-
     return output
 
 def MatMul_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendContext = None, **kwargs) -> torch.Tensor:
@@ -1552,7 +1551,7 @@ def Pad_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendCont
     elif len(pads) == 4:
         pads = [pads[1], pads[3], pads[0], pads[2]]
     elif len(pads) == 8:  # inception v3, i don't kown if the order is correct.
-        pads = [pads[2], pads[3], pads[6], pads[7]]
+        pads = [pads[3], pads[7], pads[2], pads[6]]
 
     if mode == 'constant':
         constant_value = values[-1] if len(values) == 3 else 0
@@ -1575,19 +1574,6 @@ def Sqrt_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendCon
 def Log_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendContext = None, **kwargs):
     input_data = values[0]
     output = torch.log(input_data)
-    return output
-
-
-def Mod_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendContext = None, **kwargs):
-    ASSERT_ALL_TENSORS_AT_SAME_DEVICE(op=op, values=values)
-    ASSERT_NUM_OF_INPUT(op=op, values=values, min_num_of_input=2, max_num_of_input=2)
-    fmod = op.attributes.get('fmod', 0)
-    if values[0].dtype in {torch.float, torch.float16, torch.float32, torch.float64}:
-        assert fmod, 'fmod must equals to 1 when operands are floats'
-    if fmod:
-        output = torch.fmod(values[0], values[1])
-    else:
-        output = torch.remainder(values[0], values[1])
     return output
 
 
@@ -2040,14 +2026,29 @@ def GRU_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendCont
     linear_before_reset = GET_ATTRIBUTE_FROM_OPERATION(op=op, attribute='linear_before_reset', default=0)
     if linear_before_reset == 0: raise NotImplementedError('PPQ do not support linear_before_reset = 0')
     x, w, r, b, _, h = values
+    num_of_elements = b.numel() // 6
     # _VF.gru needs following arugments:
     # input_x, batchsize, hidden_state, flatten_weights, need_bias(bool),
     # num_of_layer, dropout, is_training(bool), is_bidirectional(bool)
-    
+    w = torch.cat([
+        w[0][num_of_elements * 1: num_of_elements * 2],
+        w[0][num_of_elements * 0: num_of_elements * 1],
+        w[0][num_of_elements * 2: num_of_elements * 3]], dim=0).contiguous()
+    r = torch.cat([
+        r[0][num_of_elements * 1: num_of_elements * 2],
+        r[0][num_of_elements * 0: num_of_elements * 1],
+        r[0][num_of_elements * 2: num_of_elements * 3]], dim=0).contiguous()
+    b1 = torch.cat([
+        b[0, num_of_elements * 1: num_of_elements * 2],
+        b[0, num_of_elements * 0: num_of_elements * 1],
+        b[0, num_of_elements * 2: num_of_elements * 3]]).contiguous()
+    b2 = torch.cat([
+        b[0, num_of_elements * 4: num_of_elements * 5],
+        b[0, num_of_elements * 3: num_of_elements * 4],
+        b[0, num_of_elements * 5: num_of_elements * 6]]).contiguous()
     hidden_vector, last_state = _VF.gru(
-        x, h, (w[0], r[0], b[0, :b.shape[-1] // 2], b[0, b.shape[-1] // 2:]), True,
-        1, 0.0, False, False, False)
-    return hidden_vector.unsqueeze(1), last_state.squeeze(0).unsqueeze(0)
+        x, h, (w, r, b1, b2), True, 1, 0.0, False, False, False)
+    return hidden_vector.unsqueeze(1), last_state
 
 
 def Neg_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendContext = None, **kwargs) -> torch.Tensor:
@@ -2104,6 +2105,11 @@ def PPQDeviceSwitch_forward(op: Operation, values: List[torch.Tensor], ctx: Torc
     return value.to(ctx.executing_device)
 
 
+def Identity_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendContext = None, **kwargs) -> torch.Tensor:
+    ASSERT_ALL_TENSORS_AT_SAME_DEVICE(op=op, values=values)
+    ASSERT_NUM_OF_INPUT(op=op, values=values, min_num_of_input=1, max_num_of_input=1)
+    return values[0]
+
 
 DEFAULT_BACKEND_TABLE = {
     'Add': Add_forward,
@@ -2136,7 +2142,6 @@ DEFAULT_BACKEND_TABLE = {
     'Max': Eltwise_forward,
     'MaxPool': MaxPool2d_forward,
     'Min': Eltwise_forward,
-    'Mod': Mod_forward,
     'Mul': Mul_forward,
     'NonMaxSuppression': _NMS_forward,
     'NonZero': NonZero_forward,
@@ -2185,5 +2190,6 @@ DEFAULT_BACKEND_TABLE = {
     'HardSwish': HardSwish_forward,
     'Neg': Neg_forward,
     'GRU': GRU_forward,
-    'PPQDeviceSwitch': PPQDeviceSwitch_forward
+    'PPQDeviceSwitch': PPQDeviceSwitch_forward,
+    'Identity': Identity_forward
 }

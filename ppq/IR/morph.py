@@ -324,7 +324,7 @@ class GraphFormatter(GraphCommandProcesser):
         
         mark_to_delete, delete_queue, didx = set(), [], 0
         delete_queue.extend(var.dest_ops)
-        while len(delete_queue) > 0:
+        while didx < len(delete_queue):
             first_op = delete_queue[didx]
             if first_op not in mark_to_delete:
                 mark_to_delete.add(first_op)
@@ -360,12 +360,20 @@ class GraphFormatter(GraphCommandProcesser):
             var_blacklist = set()
             # delete all variables that links to invalid operations:
             for var in self.graph.variables.values():
+                # 删除无根无输出的变量
+                if var.source_op is None and len(var.dest_ops) == 0:
+                    var_blacklist.add(var)
+                
+                # 删除根节点不在图中的变量
                 if var.source_op is not None and var.source_op.name not in self.graph.operations:
                     var_blacklist.add(var)
+                
+                # 删除连接到未知节点的变量
                 for op in var.dest_ops:
                     if op.name not in self.graph.operations:
                         var_blacklist.add(var)
 
+                # 删除孤立变量
                 if var.source_op is None and var.name not in self.graph.inputs:
                     if not var.is_parameter:
                         var_blacklist.add(var)
@@ -506,12 +514,9 @@ class GraphMerger(GraphCommandProcesser):
 
             if computing_op.num_of_parameters == 1:
                 w = computing_op.parameters[0].value  # no bias.
-                assert isinstance(w, np.ndarray), 'values of parameters are assumed numpy arrays'
-                if computing_op.type == 'ConvTranspose':
-                    b = np.zeros(shape=w.shape[1] * computing_op.attributes.get('group', 1), dtype=np.float32)
-                elif computing_op.type == 'Gemm' and computing_op.attributes.get('transB', 0) == 0:
-                    b = np.zeros(shape=w.shape[1], dtype=np.float32)
-                else:
+                if isinstance(w, torch.Tensor):
+                    b = torch.zeros(size=w.shape[0], dtype=torch.float, device=w.device)
+                if isinstance(w, np.ndarray):
                     b = np.zeros(shape=w.shape[0], dtype=np.float32)
             else:
                 w, b = [var.value for var in computing_op.parameters[: 2]]  # has bias.
@@ -527,20 +532,9 @@ class GraphMerger(GraphCommandProcesser):
 
                 # calculate new weight and bias
                 scale = alpha / np.sqrt(var + epsilon)
-                if computing_op.attributes.get('transB', 0):
-                    w = w * scale.reshape([-1, 1])
-                else:
-                    w = w * scale.reshape([1, -1])
+                w = w * scale.reshape([-1, 1])
                 b = alpha * (b - mean) / np.sqrt(var + epsilon) + beta
-            
-            elif computing_op.type == 'ConvTranspose':
 
-                scale = alpha / np.sqrt(var + epsilon)
-                group = computing_op.attributes.get('group', 1)
-                scale = scale.reshape([group, 1, -1, 1, 1])
-                w = w.reshape([group, -1, w.shape[1], w.shape[2], w.shape[3]]) * scale
-                w = w.reshape([w.shape[0] * w.shape[1], w.shape[2], w.shape[3], w.shape[4]])
-                b = alpha * (b - mean) / np.sqrt(var + epsilon) + beta
             else:
                 raise TypeError(
                     f'Unexpected op type {computing_op.type}. '

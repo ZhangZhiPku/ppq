@@ -1,6 +1,6 @@
 from .base.command import GraphCommand, GraphCommandType
 from .base.graph import (BaseGraph, GraphBuilder, GraphExporter, Operation,
-                         Variable)
+                         Variable, OperationExporter)
 from .deploy import RunnableGraph
 from .morph import GraphFormatter, GraphMerger, GraphReplacer
 from .processer import DefaultGraphProcesser, GraphCommandProcesser

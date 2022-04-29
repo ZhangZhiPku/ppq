@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import List, Tuple
 
 import numpy as np
 import onnx
@@ -13,6 +13,10 @@ from ppq.core import (EXPORT_DEVICE_SWITCHER, ORT_MICROSOFT_CONTRIB_LINEAR_OPS,
 from ppq.IR import BaseGraph, Operation, QuantableVariable, Variable
 from ppq.IR.morph import GraphDeviceSwitcher
 from ppq.IR.quantize import QuantableOperation
+from ppq.core.common import PASSIVE_OPERATIONS
+from ppq.core.defs import ppq_warning
+from ppq.quantization.qfunction.linear import PPQLinearQuant_toInt
+from ppq.utils.round import ppq_tensor_round
 
 from .onnxruntime_exporter import ONNXRUNTIMExporter
 
@@ -216,7 +220,8 @@ class ORTOOSExporter(ONNXRUNTIMExporter):
             quant_value = self.quantize_weight(
                 var.value, scale, offset, is_asymmetrical, is_per_channel
             )
-        quant_val = Variable(
+        # quant_val = graph.create_variable(value=quant_value, is_parameter=True) 
+        Variable(
             name=var.name + quantize_suffix,
             value=quant_value,
             is_parameter=True,
@@ -619,171 +624,126 @@ class ORTOOSExporter(ONNXRUNTIMExporter):
                 for output_meta in op.meta_data.output_metas:
                     output_meta.dtype = self.get_qlinear_op_dominant_dtype(op)
 
-    def export(self, file_path: str, graph: BaseGraph, config_path: str = None) -> None:
-        # remove switchers.
-        if not EXPORT_DEVICE_SWITCHER:
-            processer = GraphDeviceSwitcher(graph)
-            processer.remove_switcher()
+    def conversion_preprocess(self, op: Operation) -> Tuple[List[Variable], List[TensorMeta]]:
+        """
+        Detach all input variable from given op, prepare for inserting input variable for it.
 
-        # if a valid config path is given, export quantization config to there.
-        if config_path is not None:
-            super().export_quantization_config(config_path, graph)
+        Args:
+            op (Operation): _description_
 
-        # collect quantable vars, where we need to insert quant and dequant op
-        # note that we assume all quantization configs of the same variable maintained
-        # by different ops are actually the same
-        quantable_vars, removed_activations = [], []
-        for var in graph.variables.values():
-            if isinstance(var, QuantableVariable):
-                configs = [var.source_op_config] + var.dest_op_configs
-                for cfg in configs:
-                    if cfg is not None and not QuantizationStates.can_export(cfg.state):
-                        raise AttributeError(
-                            f"quantization state of variable {var.name} is unexpected, \
-                        please check if you have finished the whole quantization process"
-                        )
-                    elif cfg is not None and cfg.state not in {
-                        QuantizationStates.FP32,
-                        QuantizationStates.SOI,
-                    }:
-                        quantable_vars.append(var)
-                        break
+        Returns:
+            List[Variable]: all detached variable
+        """
+        inputs = [var for var in op.inputs]
+        input_metas = op.meta_data.input_metas.copy()
+        for var in op.inputs:
+            var.dest_ops.remove(op)
+        op.inputs.clear()
+        op.meta_data.input_metas.clear()
+        return inputs, input_metas
 
-        # Pass 1: remove activations
-        for var in quantable_vars:
-            if (
-                var.is_parameter is False
-                and var.source_op is not None
-                and var.source_op.type in ORT_OOS_FUSE_START_OPS
-                and len(var.dest_ops) == 1
-                and var.dest_ops[0].type in self.removed_activation_types
-            ):
-                removed_activations.extend(var.dest_ops)
-        self.remove_activation_ops(graph, removed_activations)
+    def convert_operation(self, graph: BaseGraph, op: QuantableOperation, 
+                          process_activation: bool, process_parameter: bool, 
+                          quant_param_to_int: bool):
+        """
+        Convert an operation to onnx operator oriented format.
+        There are 2 ways to represent quantized ONNX models:
 
-        # Pass 2: insert QuantizeLinear & DequantizeLinear ops
-        for var in quantable_vars:
-            is_output_var = var.name in graph.outputs
-            # removed activations
-            if not var.dest_ops and is_output_var is False:
-                continue
-            if var.is_parameter is False:
-                # add DequantizeLinear before output if necessary
-                if (
-                    var.source_op is not None
-                    and var.source_op.type in self.qlinear_op_map
-                    and is_output_var
-                ):
-                    self.insert_dequant_Linear_operation(graph, var, 0, True)
-                else:
-                    quant_op = None
-                    dequant_op = None
-                    pop_list = []
-                    relink_node_pair = []
-                    for index, dest_op in enumerate(var.dest_ops):
-                        if self.is_quantized_qlinear_op(
-                            var.source_op
-                        ) and self.is_quantized_qlinear_op(dest_op):
-                            self.add_quantize_linear_op_quant_parameter(
-                                graph, var, index
-                            )
-                        elif var.source_op is not None and self.is_quantized_qlinear_op(
-                            var.source_op
-                        ):
-                            old_index = var.dest_idx[index]
-                            if dequant_op is None:
-                                dequant_op = self.insert_dequant_Linear_operation(
-                                    graph, var, index, False
-                                )
-                            dequant_op.outputs[0].dest_ops.append(dest_op)
-                            relink_node_pair.append((dest_op, old_index, dequant_op))
-                            if (
-                                dequant_op in var.dest_ops
-                                and var.dest_ops.index(dequant_op) != index
-                            ):
-                                pop_list.append(dest_op)
-                        elif self.is_quantized_qlinear_op(dest_op):
-                            old_index = var.dest_idx[index]
-                            if quant_op is None:
-                                quant_op = self.insert_quant_Linear_operation(
-                                    graph, var, index
-                                )
-                            quant_op.outputs[0].dest_ops.append(dest_op)
-                            relink_node_pair.append((dest_op, old_index, quant_op))
-                            if (
-                                quant_op in var.dest_ops
-                                and var.dest_ops.index(quant_op) != index
-                            ):
-                                pop_list.append(dest_op)
-                    # successors which now follows QuantizeLinear/DequantizeLinear ops
-                    for dest_op in pop_list:
-                        pop_index = var.dest_ops.index(dest_op)
-                        var.dest_ops.pop(pop_index)
-                    for node, index, quantize_node in relink_node_pair:
-                        node.inputs[index] = quantize_node.outputs[0]
+        Operator Oriented. All the quantized operators have their own ONNX definitions,
+            like QLinearConv, MatMulInteger and etc.
+        
+        Tensor Oriented, aka Quantize and DeQuantize (QDQ). 
+            This format uses DQ(Q(tensor)) to simulate the quantize and dequantize process, 
+            and QuantizeLinear and DeQuantizeLinear operators also carry the quantization parameters. 
+            
+        Quantization-Aware training (QAT) models converted from Tensorflow or exported from PyTorch.
+        
+        Quantized models converted from tflite and other framework.
 
-        # Pass 3 Transform QLinear ops
-        for operation in graph.topological_sort():
-            if self.is_quantized_qlinear_op(operation):
-                self.transform_qlinear_operation(operation, graph)
+        Args:
+            graph (BaseGraph): _description_
+            op (QuantableOperation): _description_
+            process_activation (bool): _description_
+            process_parameter (bool): _description_
+            quant_param_to_int (bool): _description_
 
-        # Pass 4 collect meta info for parameters and newly-added variables
-        self.correct_param_meta(graph)
+        Returns:
+            _type_: _description_
+        """
+        if op.type in {
+                'Conv', 'Gemm', 'Matmul', 'AveragePool', 'LeakyRelu', 'Sigmoid',
+                'GlobalAveragePool', 'Add', 'Mul', 'Concat', 'ReduceMean'}:
+            # Those operation can convert to onnx opeartion-oriented quantized op.
 
-        # Pass 5 transform other ops
-        self.convert_operation_from_opset11_to_opset13(graph)
+            inputs, input_metas = self.conversion_preprocess(op)
+            bias, bias_meta, bias_config = None, None, None
+            if op.type in {'Conv', 'Gemm'} and len(inputs) > 3: # has bias
+                bias        = inputs[-1]
+                bias_meta   = bias.meta
+                bias_config = op.config.output_quantization_config[-1]
+                inputs = inputs[: -1] # remove bias from inputs, process it later.
 
-        name = graph._name
-        if not name:
-            name = "PPL Quantization Tool - Onnx Export"
+            # process input
+            for config, var, meta in zip(op.config.input_quantization_config, inputs, input_metas):
+                otype, vtype = self.infer_qtype(config)
+                scale  = convert_any_to_torch_tensor(config.scale.clone(), dtype=torch.float32)
+                offset = ppq_tensor_round(config.offset.clone()).type(otype)
 
-        # Ready to export onnx graph defination.
-        _inputs, _outputs, _initilizers, _nodes, _value_infos = [], [], [], [], []
-        for operation in graph.topological_sort():
-            _nodes.append(self.export_operation(operation))
+                if var.is_parameter:
+                    if config.state not in {
+                        QuantizationStates.ACTIVATED, QuantizationStates.PASSIVE, 
+                        QuantizationStates.PASSIVE_BAKED, QuantizationStates.BAKED}:
+                        raise PermissionError(
+                            f'Can not export operation {op.name} in onnx operator oriented quantize format, '
+                            f'Cause its parameter {var.name} has not been correctly quantized.')
 
-        for variable in graph.variables.values():
-            tensor_proto = self.export_var(variable)
-            if variable.name in graph.inputs:
-                _inputs.append(tensor_proto)
-            if variable.name in graph.outputs:
-                _outputs.append(tensor_proto)
-            if variable.is_parameter:
-                _initilizers.append(tensor_proto)
-            else:
-                _value_infos.append(tensor_proto)
+                    if config.num_of_bits != 8:
+                        raise PermissionError(
+                            f'Can not export operation {op.name} in onnx operator oriented quantize format, '
+                            f'Cause its parameter {var.name} is not quantized with 8 bits.')
 
-        graph_def = helper.make_graph(
-            name=name,
-            nodes=_nodes,
-            inputs=_inputs,
-            outputs=_outputs,
-            initializer=_initilizers,
-            value_info=_value_infos,
-        )
+                    config.state = QuantizationStates.ACTIVATED
+                    var.value    = PPQLinearQuant_toInt(tensor=var.value, config=config)
 
-        extra_opsets = self.required_opsets
+                graph.create_link_with_op(variable=var, upstream_op=None, downstream_op=op)
+                graph.create_link_with_op(
+                    variable=graph.create_variable(value=scale, is_parameter=True), 
+                    upstream_op=None, downstream_op=op)
+                graph.create_link_with_op(
+                    variable=graph.create_variable(value=offset, is_parameter=True), 
+                    upstream_op=None, downstream_op=op)
+                op.meta_data.input_metas.extend([
+                    TensorMeta(dtype=DataType.convert_from_torch(vtype), shape=meta.shape), 
+                    TensorMeta(dtype=DataType.FP32, shape=config.scale.shape), 
+                    TensorMeta(dtype=DataType.convert_from_torch(otype), shape=config.offset.shape)])
 
-        if "opsets" in graph._detail:
-            opsets = []
-            for opset in graph._detail["opsets"]:
-                # last condition shall be removed if we wanna run checker
-                if opset["domain"] in extra_opsets or opset["domain"] == "":
-                    continue
-                op = onnx.OperatorSetIdProto()
-                op.domain = opset["domain"]
-                op.version = opset["version"]
-                opsets.append(op)
+            # process output
+            assert len(op.outputs) == 1, 'Oops seems we got something wrong here.'
+            config, var = op.config.output_quantization_config[0], op.outputs[0]
+            graph.create_link_with_op(
+                variable=graph.create_variable(value=scale, is_parameter=True), 
+                upstream_op=None, downstream_op=op)
+            graph.create_link_with_op(
+                variable=graph.create_variable(value=offset, is_parameter=True), 
+                upstream_op=None, downstream_op=op)
+            op.meta_data.input_metas.extend([
+                TensorMeta(dtype=DataType.FP32, shape=config.scale.shape), 
+                TensorMeta(dtype=DataType.convert_from_torch(otype), shape=config.offset.shape)])
 
-        for key, value in extra_opsets.items():
-            op = onnx.OperatorSetIdProto()
-            op.domain = key
-            op.version = value
-            opsets.append(op)
+            # process bias
+            if bias is not None:
+                if bias_config: # TODO START HERE
+                graph.create_link_with_op(variable=bias, upstream_op=None, downstream_op=op)
+                op.meta_data.input_metas.extend([TensorMeta(dtype=DataType.FP32, shape=bias_meta.shape)])
 
-        onnx_model = helper.make_model(
-            graph_def, producer_name=PPQ_NAME, opset_imports=opsets
-        )
-        onnx_model.ir_version = 7
-        # onnx.checker.check_model(onnx_model)
-        onnx.save(onnx_model, file_path)
+        elif op.type not in PASSIVE_OPERATIONS: # Those operation can not convert to onnx quantized op
+            # If opeartion is not a passive operation, skip its conversion is not safe,
+            # We have to export it within qdq format.
+            ppq_warning(f'Operation {op.name} can not convert to onnx oos quantized format, '
+                        'ppq will export it in onnx qdq format.')
+            return super().convert_operation(
+                graph, op, process_activation, 
+                process_parameter, quant_param_to_int)
+        else:
+            # If operation is passive, skip it is safe.
+            pass

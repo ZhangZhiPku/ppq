@@ -664,14 +664,16 @@ class BaseGraph(Serializable):
         if source_op is not None:
             assert isinstance(source_op, Operation), (
                 f'Can not remove variable {removing_var.name}, it links to a unexpected source operation.')
-            source_op.outputs.remove(removing_var)
+            if removing_var in source_op.outputs:
+                source_op.outputs.remove(removing_var)
             removing_var.source_op = None
         
         # remove from all dest ops
         for dest_op in removing_var.dest_ops:
             assert isinstance(dest_op, Operation), (
                 f'Can not remove variable {removing_var.name}, it links to a unexpected dest operation.')
-            dest_op.inputs.remove(removing_var)
+            if removing_var in dest_op.inputs:
+                dest_op.inputs.remove(removing_var)
         removing_var.dest_ops.clear()
 
         if removing_var.name in self.outputs:
@@ -686,6 +688,30 @@ class BaseGraph(Serializable):
     def create_operation(self, op_type: str,  name: str = None, 
         attributes: Dict[str, Any] = None, platform: TargetPlatform = TargetPlatform.UNSPECIFIED,
         inputs: List[Variable] = None, outputs: List[Variable] = None, **kwargs) -> Operation:
+        """
+        Create an operation and attach it it current graph.
+        op_type is mandatory here, however op_name is not required.
+        PPQ will automatically generates a name for your operation: PPQ_Operation_{self._num_of_generated_op}.
+
+        Use this function carefully, cause once your network is quantized, 
+            simply create an operation via this function might cause unexpected error.
+        Beawre that operation created by this function has no meta data and quantization info, 
+            which is needed to export and executing your graph.
+
+        Do not set inputs and outputs via this function, 
+            to link your operation with others, use graph.create_link_with_var instead.
+
+        Args:
+            op_type (str): _description_
+            name (str, optional): _description_. Defaults to None.
+            attributes (Dict[str, Any], optional): _description_. Defaults to None.
+            platform (TargetPlatform, optional): _description_. Defaults to TargetPlatform.UNSPECIFIED.
+            inputs (List[Variable], optional): _description_. Defaults to None.
+            outputs (List[Variable], optional): _description_. Defaults to None.
+
+        Returns:
+            Operation: _description_
+        """
         if name is None:
             name = f'PPQ_Operation_{self._num_of_generated_op}'
             self._num_of_generated_op += 1
@@ -704,6 +730,27 @@ class BaseGraph(Serializable):
 
     def create_variable(self, name: str = None, value: Any = None, is_parameter: bool = False,
         dest_ops: List[OperationBase] = None, source_op: OperationBase = None, **kwargs) -> Variable:
+        """
+        Create a variable and attach it it current graph.
+        PPQ will automatically generates a name for your variable: PPQ_Variable_{self._num_of_generated_op}.
+
+        Use this function carefully, cause once your network is quantized, 
+            simply create an variable via this function might cause unexpected error.
+        You'd better invoke this function before running your quantizer.
+
+        Do not set dest_ops and source_op via this function, 
+            to link this variable with others, use graph.create_link_with_var instead.
+
+        Args:
+            name (str, optional): _description_. Defaults to None.
+            value (Any, optional): _description_. Defaults to None.
+            is_parameter (bool, optional): _description_. Defaults to False.
+            dest_ops (List[OperationBase], optional): _description_. Defaults to None.
+            source_op (OperationBase, optional): _description_. Defaults to None.
+
+        Returns:
+            Variable: _description_
+        """
         if name is None:
             name = f'PPQ_Variable_{self._num_of_generated_var}'
             self._num_of_generated_var += 1
@@ -776,3 +823,8 @@ class GraphBuilder(metaclass=SingletonMeta):
 class GraphExporter(metaclass=SingletonMeta):
     @ abstractmethod
     def export(self, file_path: str, graph: BaseGraph, config_path: str = None, **kwargs): pass
+
+
+class OperationExporter(metaclass=SingletonMeta):
+    @ abstractmethod
+    def export(self, operation:Operation, graph: BaseGraph, **kwargs) -> Operation: pass

@@ -9,7 +9,7 @@ from ppq.core import (NetworkFramework, OperationQuantizationConfig,
 from ppq.executor import BaseGraphExecutor, TorchExecutor
 from ppq.IR import BaseGraph, GraphCommandProcesser, Operation, Variable
 from ppq.IR.base.command import QuantizeOperationCommand
-from ppq.IR.morph import GraphReplacer
+from ppq.IR.morph import GraphFormatter, GraphReplacer
 from ppq.IR.quantize import QuantableGraph, QuantableOperation
 from ppq.IR.search import Path, SearchableGraph
 from ppq.log import NaiveLogger
@@ -883,9 +883,8 @@ class GRUSplitPass(QuantizationOptimizationPass):
         super().__init__(name)
     
     def delete_hidden_vec(self, graph: BaseGraph, hidden_vec: Variable):
-        for operation in hidden_vec.dest_ops:
-            graph.delete_operation(operation.name, cascade=True, force_delete=True)
-        graph.remove_variable(hidden_vec)
+        processer = GraphFormatter(graph)
+        processer.truncate_on_var(var=hidden_vec, mark_as_output=False)
     
     # Implementation of Gemm Split will move to IR.morph soon.
     def optimize(self, processer: GraphCommandProcesser, 
@@ -907,31 +906,31 @@ class GRUSplitPass(QuantizationOptimizationPass):
             
             # Take a further look at
             # https://github.com/onnx/onnx/blob/main/docs/Operators.md#GRU
-            Wz = rnn_w.value[0, 0: hidden_size, :]
-            Wr = rnn_w.value[0, hidden_size: hidden_size * 2, :]
-            Wh = rnn_w.value[0, hidden_size * 2: hidden_size * 3, :]
+            Wz = rnn_w.value[0, hidden_size * 0: hidden_size * 1]
+            Wr = rnn_w.value[0, hidden_size * 1: hidden_size * 2]
+            Wh = rnn_w.value[0, hidden_size * 2: hidden_size * 3]
             
-            Rz = rnn_r.value[0, 0: hidden_size, :]
-            Rr = rnn_r.value[0, hidden_size: hidden_size * 2, :]
-            Rh = rnn_r.value[0, hidden_size * 2: hidden_size * 3, :]
+            Rz = rnn_r.value[0, hidden_size * 0: hidden_size * 1]
+            Rr = rnn_r.value[0, hidden_size * 1: hidden_size * 2]
+            Rh = rnn_r.value[0, hidden_size * 2: hidden_size * 3]
             
-            Wbz = rnn_b.value[0, 0: hidden_size]
+            Wbz = rnn_b.value[0, hidden_size * 0: hidden_size * 1]
             Wbr = rnn_b.value[0, hidden_size * 1: hidden_size * 2]
             Wbh = rnn_b.value[0, hidden_size * 2: hidden_size * 3]
 
             Rbz = rnn_b.value[0, hidden_size * 3: hidden_size * 4]
             Rbr = rnn_b.value[0, hidden_size * 4: hidden_size * 5]
             Rbh = rnn_b.value[0, hidden_size * 5: hidden_size * 6]
-            
+
             # create operations
-            op1 = graph.create_operation(op_type='Gemm', attributes={'TransB': 1})
-            op2 = graph.create_operation(op_type='Gemm', attributes={'TransB': 1})
+            op1 = graph.create_operation(op_type='Gemm', attributes={'transB': 1})
+            op2 = graph.create_operation(op_type='Gemm', attributes={'transB': 1})
             op3 = graph.create_operation(op_type='Add')
             op4 = graph.create_operation(op_type='Sigmoid')
             op5 = graph.create_operation(op_type='Slice')
             op6 = graph.create_operation(op_type='Slice')
-            op7 = graph.create_operation(op_type='Gemm', attributes={'TransB': 1})
-            op8 = graph.create_operation(op_type='Gemm', attributes={'TransB': 1})
+            op7 = graph.create_operation(op_type='Gemm', attributes={'transB': 1})
+            op8 = graph.create_operation(op_type='Gemm', attributes={'transB': 1})
             op9 = graph.create_operation(op_type='Mul')
             op10 = graph.create_operation(op_type='Mul')
             op11 = graph.create_operation(op_type='Sub')
@@ -960,10 +959,15 @@ class GRUSplitPass(QuantizationOptimizationPass):
             graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op1, downstream_op=op3)
             graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op2, downstream_op=op3)
             graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op3, downstream_op=op4)
-            graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op4, downstream_op=op6)
-            graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op4, downstream_op=op5)
-            graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op5, downstream_op=op11)
-            graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op5, downstream_op=op10)
+            
+            var = graph.create_variable()
+            graph.create_link_with_op(variable=var, upstream_op=op4, downstream_op=op5)
+            graph.create_link_with_op(variable=var, upstream_op=op4, downstream_op=op6)
+            
+            var = graph.create_variable()
+            graph.create_link_with_op(variable=var, upstream_op=op5, downstream_op=op11)
+            graph.create_link_with_op(variable=var, upstream_op=op5, downstream_op=op10)
+            
             graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op6, downstream_op=op9)
             graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op7, downstream_op=op9)
             graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op8, downstream_op=op12)
@@ -973,20 +977,22 @@ class GRUSplitPass(QuantizationOptimizationPass):
             graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op12, downstream_op=op14)
             graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op13, downstream_op=op15)
             graph.create_link_with_op(variable=graph.create_variable(), upstream_op=op14, downstream_op=op13)
-            
+
             # mark h as graph input, link h to op2, op10 and op7
             rnn_h.source_op.outputs.remove(rnn_h)
             rnn_h.source_op = None
+            rnn_h.dest_ops.remove(op)
             graph.mark_variable_as_graph_input(rnn_h)
             graph.create_link_with_op(variable=rnn_h, upstream_op=None, downstream_op=op2)
             graph.create_link_with_op(variable=rnn_h, upstream_op=None, downstream_op=op7)
             graph.create_link_with_op(variable=rnn_h, upstream_op=None, downstream_op=op10)
-            
+
             # link x to op1 and op8
             rnn_x.dest_ops.remove(op)
             graph.create_link_with_op(variable=rnn_x, upstream_op=rnn_x.source_op, downstream_op=op1)
             graph.create_link_with_op(variable=rnn_x, upstream_op=rnn_x.source_op, downstream_op=op8)
-            
+
+            # create paramteres
             graph.create_link_with_op(variable=Wzr_var, upstream_op=None, downstream_op=op1)
             graph.create_link_with_op(variable=Rzr_var, upstream_op=None, downstream_op=op2)
             graph.create_link_with_op(variable=Wh_var, upstream_op=None, downstream_op=op8)
@@ -995,6 +1001,24 @@ class GRUSplitPass(QuantizationOptimizationPass):
             graph.create_link_with_op(variable=Rbzr_var, upstream_op=None, downstream_op=op2)
             graph.create_link_with_op(variable=Wbh_var, upstream_op=None, downstream_op=op8)
             graph.create_link_with_op(variable=Rbh_var, upstream_op=None, downstream_op=op7)
+            
+            graph.create_link_with_op(variable=graph.create_variable(
+                value=torch.tensor([0]), is_parameter=True), upstream_op=None, downstream_op=op5)
+            graph.create_link_with_op(variable=graph.create_variable(
+                value=torch.tensor([hidden_size]), is_parameter=True), upstream_op=None, downstream_op=op5)
+            graph.create_link_with_op(variable=graph.create_variable(
+                value=torch.tensor([1]), is_parameter=True), upstream_op=None, downstream_op=op5)
+            graph.create_link_with_op(variable=graph.create_variable(
+                value=torch.tensor([1]), is_parameter=True), upstream_op=None, downstream_op=op5)
+            
+            graph.create_link_with_op(variable=graph.create_variable(
+                value=torch.tensor([hidden_size]), is_parameter=True), upstream_op=None, downstream_op=op6)
+            graph.create_link_with_op(variable=graph.create_variable(
+                value=torch.tensor([2 * hidden_size]), is_parameter=True), upstream_op=None, downstream_op=op6)
+            graph.create_link_with_op(variable=graph.create_variable(
+                value=torch.tensor([1]), is_parameter=True), upstream_op=None, downstream_op=op6)
+            graph.create_link_with_op(variable=graph.create_variable(
+                value=torch.tensor([1]), is_parameter=True), upstream_op=None, downstream_op=op6)
 
             hidden_vec, last_state = op.outputs
             last_state.source_op = op15

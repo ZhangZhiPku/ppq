@@ -23,7 +23,8 @@ from ppq.quantization.quantizer import (ACADEMIC_INT4_Quantizer,
                                         PPL_DSP_TI_Quantizer,
                                         PPLCUDA_INT4_Quantizer,
                                         PPLCUDAMixPrecisionQuantizer,
-                                        PPLCUDAQuantizer, TensorRTQuantizer)
+                                        PPLCUDAQuantizer, TensorRTQuantizer,
+                                        FPGAQuantizer)
 from ppq.scheduler import DISPATCHER_TABLE, GraphDispatcher
 from torch.utils.data import DataLoader
 
@@ -46,7 +47,8 @@ QUANTIZER_COLLECTION = {
     TargetPlatform.PPL_CUDA_INT4: PPLCUDA_INT4_Quantizer,
     TargetPlatform.ACADEMIC_INT8: ACADEMICQuantizer,
     TargetPlatform.ACADEMIC_INT4: ACADEMIC_INT4_Quantizer,
-    TargetPlatform.ACADEMIC_MIX:  ACADEMIC_Mix_Quantizer
+    TargetPlatform.ACADEMIC_MIX:  ACADEMIC_Mix_Quantizer,
+    TargetPlatform.FPGA_INT8   :  FPGAQuantizer
 }
 
 PARSERS = {
@@ -79,7 +81,7 @@ EXPORTERS = {
 EXPORTING_POSTFIX = {
     TargetPlatform.PPL_DSP_INT8:  '.caffemodel',
     TargetPlatform.PPL_DSP_TI_INT8:'.caffemodel',
-    TargetPlatform.QNN_DSP_INT8: '.onnx',
+    TargetPlatform.QNN_DSP_INT8:  '.onnx',
     TargetPlatform.PPL_CUDA_INT8: '.onnx',
     TargetPlatform.SNPE_INT8:     '.caffemodel',
     TargetPlatform.NXP_INT8:      '.caffemodel',
