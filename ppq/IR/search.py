@@ -360,6 +360,9 @@ class TreePatternMatcher:
         
         # 递归终止于 pattern 结尾
         if len(pnode.edges) == 0:
+            if self._interal_store[node_idx] is not None:
+                if self._interal_store[node_idx] != op:
+                    return False # 这种情况出现于复杂模式，直接返回失败即可
             self._interal_store[node_idx] = op
             return True
 
@@ -393,6 +396,9 @@ class TreePatternMatcher:
         # 二部图匹配成功，则 matching_solver.matched 中按顺序存储了匹配到的 op index
         # 以此继续向下递归
         for pattern_idx, op_idx in enumerate(matching_solver.matched):
+            if self._interal_store[node_idx] is not None:
+                if self._interal_store[node_idx] != op:
+                    return False # 这种情况出现于复杂模式，直接返回失败即可
             self._interal_store[node_idx] = op
             flag = self._match(graph=graph, op=following_ops[op_idx], 
                                node_idx=pnode.edges[pattern_idx], exclusive=exclusive)

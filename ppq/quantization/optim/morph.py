@@ -7,11 +7,10 @@ from ppq.core import (NetworkFramework, OperationQuantizationConfig,
                       QuantizationStates, TensorMeta, TensorQuantizationConfig,
                       empty_ppq_cache, ppq_warning)
 from ppq.executor import BaseGraphExecutor, TorchExecutor
-from ppq.IR import BaseGraph, GraphCommandProcesser, Operation, Variable
+from ppq.IR import (BaseGraph, GraphCommandProcesser, GraphFormatter,
+                    GraphReplacer, Operation, Path, QuantableGraph,
+                    QuantableOperation, SearchableGraph, Variable)
 from ppq.IR.base.command import QuantizeOperationCommand
-from ppq.IR.morph import GraphFormatter, GraphReplacer
-from ppq.IR.quantize import QuantableGraph, QuantableOperation
-from ppq.IR.search import Path, SearchableGraph
 from ppq.log import NaiveLogger
 from ppq.quantization.observer import TensorObserverFactroy
 from tqdm import tqdm

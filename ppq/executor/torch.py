@@ -1,12 +1,11 @@
 from typing import Any, Callable, Dict, List, Union
 
 import numpy
-from ppq.core import (OperationMeta, QuantizationStates, TargetPlatform,
-                      TensorMeta, TensorQuantizationConfig, empty_ppq_cache)
+from ppq.core import (DataType, OperationMeta, QuantizationStates,
+                      TargetPlatform, TensorMeta, TensorQuantizationConfig,
+                      empty_ppq_cache, ppq_warning)
 from ppq.IR import BaseGraph, Operation, QuantableOperation, RunnableGraph
 from ppq.IR.base.command import GraphDeployCommand
-from ppq.core.data import DataType
-from ppq.core.defs import ppq_warning
 from ppq.quantization.qfunction.linear import PPQLinearQuantFunction
 
 import torch

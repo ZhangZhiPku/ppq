@@ -5,7 +5,6 @@ import torch
 from numpy import ceil
 from ppq.core import *
 from ppq.executor import BaseGraphExecutor, TorchExecutor
-from ppq.executor.base import GLOBAL_DISPATCHING_TABLE
 from ppq.IR import (BaseGraph, GraphCommandProcesser, Operation,
                     QuantableOperation)
 from ppq.log import NaiveLogger
@@ -25,13 +24,26 @@ def has_bias(op: Operation):
     else: return False
 
 
-def compute_loss(output_names: List[str],
-                graph: BaseGraph,
-                dataloader: Iterable,
-                collate_fn: Callable,
-                executor: TorchExecutor,
-                loss_fn: Callable=torch_mean_square_error
+def compute_loss(
+    output_names: List[str],
+    graph: BaseGraph,
+    dataloader: Iterable,
+    collate_fn: Callable,
+    executor: TorchExecutor,
+    loss_fn: Callable=torch_mean_square_error
 ) -> Dict[str, float]:
+    """loss computing for fp32 and quantized graph outputs, used 
+    in multiple training-based algorithms below
+    Args:
+        output_names (List[str]): output variable names
+        graph (BaseGraph): ppq ir graph
+        dataloader (Iterable): calibration dataloader
+        collate_fn (Callable): batch collate func
+        executor (TorchExecutor): ppq torch executor
+        loss_fn (Callable, optional): loss computing func. Defaults to torch_mean_square_error.
+    Returns:
+        Dict[str, float]: loss dict for variables specified in `output_names`
+    """
     losses = {name: 0.0 for name in output_names}
     for idx,data in enumerate(dataloader):
         if collate_fn is not None:
@@ -49,10 +61,12 @@ def compute_loss(output_names: List[str],
         losses[name] /= (idx + 1)
     return losses
 
+
 def dequantize_graph(graph: BaseGraph, exceptions: List[Operation]=[]) -> None:
     for op in graph.operations.values():
         if isinstance(op, QuantableOperation) and op not in exceptions:
             op.dequantize(expire_device=None)
+
 
 def restore_quantization_state(graph: BaseGraph, exceptions: List[Operation]=[]) -> None:
     for op in graph.operations.values():
@@ -64,28 +78,34 @@ def find_all_blocks(graph: BaseGraph,
                 executing_order: List[Operation],
                 block_limit: int=None
     ) -> List[TrainableBlock]:
-        # block construction function of brecq and lsq algos, if block_limit is 
-        # specified, the block grandularity will be controlled by block_limit, else
-        # the default OPTIM_ADVOPT_GRAPH_MAXSIZE will be used. You can modify this
-        # as you need in your model graph structure.
-        visited_ops = set()
-        blocks = []
-        block_builder = BlockBuilder(graph=graph, topo_order=executing_order)
+    """block construction function of training-based algorithms, if `block_limit`
+    is not specified, block grandularity will be controlled by the default value
+    OPTIM_ADVOPT_GRAPH_MAXSIZE specified in ppq.core.common
+    Args:
+        graph (BaseGraph): ppq ir graph
+        executing_order (List[Operation]): topo search order
+        block_limit (int, optional): controls maximum depth of a block. Defaults to None.
+    Returns:
+        List[TrainableBlock]: list of all partitioned blocks
+    """
+    visited_ops = set()
+    blocks = []
+    block_builder = BlockBuilder(graph=graph, topo_order=executing_order)
 
-        for op in graph.operations.values():
-            # start from computing op
-            if op not in visited_ops and isinstance(op, QuantableOperation)\
-                and op.is_computing_op:
-                if block_limit is None:
-                    block = block_builder.build(op, OPTIM_ADVOPT_GRAPH_MAXDEPTH)
-                else:
-                    # use given limit
-                    block = block_builder.build(op, block_limit)
-                # by default blocks are exclusive from each other
-                for op in block.rps:
-                    visited_ops.add(op)
-                blocks.append(block)
-        return blocks
+    for op in graph.operations.values():
+        # start from computing op
+        if op not in visited_ops and isinstance(op, QuantableOperation)\
+            and op.is_computing_op:
+            if block_limit is None:
+                block = block_builder.build(op, OPTIM_ADVOPT_GRAPH_MAXDEPTH)
+            else:
+                # use given limit
+                block = block_builder.build(op, block_limit)
+            # by default blocks are exclusive from each other
+            for op in block.rps:
+                visited_ops.add(op)
+            blocks.append(block)
+    return blocks
 
 
 class TrainingBasedPass(QuantizationOptimizationPass):
@@ -506,19 +526,15 @@ class BlockwiseReconstructionPass(TrainingBasedPass):
     """Blockwise Reconstruction Pass, blockwisely perform adaround, if you specify interested_layers in the setting, 
     then only block which containes any of operations specified in interested_layers will be optimized, otherwise all
     searched blocks will be optimized.
-
        A standard procedure is, first turn all training-based optimization passes off in your quantization setting and
     run a plain quantization, then use error analysis tool(provided by ppq) to analysis snr error or cosine similarities
     of every layer, choose names of those with significant snr or poor similarities as your interested_layers, then turn
     on this pass and do optimization. In case you have no idea which layers should be selected as interested_layers, simply
     leave it as blank and all blocks will be tuned.
-
        Note that you could control the maximum number of operations in a block by setting OPTIM_ADVOPT_GRAPH_MAXSIZE in
     ppq.core.common, and by default every block will be trained for 300 epochs, which takes certain long time. The optimization
     goal of every block is
-
                 Loss = LpNormLoss(y, y^) + lamda * rounding_loss(v)
-
     where y is the output of the current block running in fp32 mode, and y^ is the output of the current block running
     in quant mode, lamda is a hyperparameter adjusting scales of rounding loss, and v is the element-wise rounding
     parameter applied to weights of every computing op in the block.
@@ -601,6 +617,9 @@ class BlockwiseReconstructionPass(TrainingBasedPass):
                 logger.info(f'Tune weight scale for {op.name} ...')
                 cfg = op.config.input_quantization_config[1]
                 weight = op.inputs[1].value
+                if cfg.policy.has_property(QuantizationProperty.POWER_OF_2):
+                    logger.warning(f'{op.name} has a power-of-2 policy, scale tuning is forbidden')
+                    continue
                 assert cfg.state == QuantizationStates.ACTIVATED, 'the config of weight param\
                 should be ACTIVATED for tuning'
                 delegator = StraightThroughEstimateDelegator(cfg, True, 1.0, device)
@@ -754,20 +773,26 @@ class BlockwiseReconstructionPass(TrainingBasedPass):
 
 class LearningStepSizeOptimization(TrainingBasedPass):
     """Learned Step Size optimization, a training-based optimization pass which tunes weight, weight scale, weight offset
-    (aym quantization) and activation scale, activation offset(asym quantization) of computing layers. 
+    (for aym quantization only) and activation scale, activation offset(for asym quantization only) of computing layers. 
     
-       You can perform a graphwise optimization which optimizes parameters of every block all together by setting mode to
-    global, or layerwise/blockwise optimization which optimizes in local range by setting mode to local. Similar to block-wise
-    reconstruction pass, interested_layers contains computing layers which suffers from large precision loss introduced by
-    quantization, and if it's not specified, this pass will try to tune all condition-satisfied comptuing layers.
-
-        In global mode, if the param output_names is not specified, then every graph output will be used to compute final loss, 
-    note that in some cases gradient can't flow back from graph outputs all the way back to every computing ops, then you 
-    should specify output_names by choosing variables which guarantee valid gradient backward to every computing op specified
-    in the interested_layers.
+        This pass will firstly partition the graph into multiple trainable blocks, and you can control partition grandularity
+    by setting the global parameter OPTIM_ADVOPT_GRAPH_MAXSIZE in ppq.core.common, usually a block contains several computing
+    operations(Conv, Gemm or ConvTranspose).
+            
+        OPTIM_ADVOPT_GRAPH_MAXSIZE = 1                     OPTIM_ADVOPT_GRAPH_MAXSIZE = 3
+             
+              __|________                                        __|_________
+               Conv    |                                          Conv     |
+                |     block-1                                      |       |
+              _Relu____|_                                         Relu     |
+              __|________                                          |      block-1
+               Conv    |                                          Conv     |
+                |     block-2                                      |       |
+              _Relu____|_                                        _Relu_____|_
+                |                                                  |
         
-        When the graph structure becomes more complicated or the global mode gets overfitting effect, you might prefer the
-    local mode, where scales and offsets are tuned blockwisely and you don't have to specify names of output variables.
+        If `interested_layers` parameter is specified, then only blocks which contains operations specified in `interested_layers`
+    will be tuned, otherwise all partitioned blocks will be tuned by default.
         
         For more information about step learning algorithm, please refer to
             Esser, Steven K., et al. "Learned step size quantization." arXiv preprint arXiv:1902.08153 (2019).
@@ -775,24 +800,16 @@ class LearningStepSizeOptimization(TrainingBasedPass):
     def __init__(self,
                 name: str = 'PPQ LSQ Optimization',
                 interested_layers: List[str] = [],
-                interested_layers_only: bool = False,
-                output_names: List[str] = [],
-                loss_weights: Dict[str, float] = {},
                 epochs: int = 30,
                 lr: float = 5e-5,
-                scale_multiplier: float = 2,
-                mode: str = 'global'
+                scale_multiplier: float = 2.0
     ) -> None:
         super().__init__(name=name)
         self.interested_layers = interested_layers
-        self.interested_layers_only = interested_layers_only
-        self.output_names = output_names
-        self.loss_weights = loss_weights
         self.epochs = epochs
         self.lr = lr
         self.scale_multiplier = scale_multiplier
-        self.mode = mode
-
+    
     def initiate_param(self,
                     block: TrainableBlock,
                     device: Union[str, torch.device]
@@ -803,6 +820,9 @@ class LearningStepSizeOptimization(TrainingBasedPass):
                 for (cfg, var) in op.config_with_variable:
                     scale_multiplier = 1.0
                     masters = []
+                    if cfg.policy.has_property(QuantizationProperty.POWER_OF_2):
+                        logger.warning(f'{op.name} has a power-of-2 policy, scale tuning is forbidden')
+                        continue
                     if cfg.state == QuantizationStates.PASSIVE and op.is_computing_op:
                         scale_multiplier = self.scale_multiplier
                         for cfg_ in op.config.input_quantization_config[:2]:
@@ -850,7 +870,7 @@ class LearningStepSizeOptimization(TrainingBasedPass):
                 op.store_parameter_value()
                 op.restore_quantize_state()
 
-    def LSQ_optimize_local(self,
+    def LSQ_optimize(self,
                 blocks: List[TrainableBlock],
                 graph: BaseGraph,
                 dataloader: Iterable,
@@ -912,93 +932,12 @@ class LearningStepSizeOptimization(TrainingBasedPass):
                 logger.warning('Loss not improved, abandon trained values...')
                 self.recover(blk)
 
-
-    def LSQ_optimize_global(self,
-                     blocks: List[TrainableBlock],
-                     graph: BaseGraph,
-                     dataloader: Iterable,
-                     collate_fn: Callable,
-                     executor: TorchExecutor
-    ) -> None:
-        output_names = [name for name in graph.outputs] if len(self.output_names) == 0 else self.output_names
-        logger.info('The following variable will be used for loss computing and gradient backward')
-        logger.info(', '.join(output_names))
-        logger.info('Computing Original Loss ...')
-        original_loss = compute_loss(output_names, graph, dataloader, collate_fn, executor)
-
-        all_params, trainable_params = {}, []
-        for blk in blocks:
-            all_params.update(self.initiate_param(blk, executor._device))
-            self.enable_grad(blk)
-            for op in blk.rps:
-                if isinstance(op, QuantableOperation) and op.is_computing_op:
-                    trainable_params.extend([var.value for var in op.inputs[1:]])
-        for cfg, delegator in all_params.items():
-            executor.register_quantize_delegate(cfg, delegator)
-            trainable_params.extend(delegator.collect_params())
-
-        optimizer = torch.optim.Adam([param for param in trainable_params if param.requires_grad], lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [int(self.epochs / 2), int(self.epochs * 2 / 3)])
-
-        for _ in tqdm(range(self.epochs), total=self.epochs, desc='LSQ Global Optimize'):
-            epoch_loss = {name: 0.0 for name in output_names}
-            for idx,data in enumerate(dataloader):
-                if collate_fn is not None:
-                    data = collate_fn(data)
-                dequantize_graph(graph)
-                fp_outputs = executor.forward(data, output_names)
-                restore_quantization_state(graph)
-                quant_outputs = executor.forward_with_gradient(data, output_names)
-                optimizer.zero_grad()
-                batch_loss = 0.0
-                for name, fp_output, quant_output in zip(output_names, fp_outputs, quant_outputs):
-                    loss = torch_mean_square_error(fp_output, quant_output)
-                    batch_loss += self.loss_weights.get(name, 1.0) * loss
-                    epoch_loss[name] += loss.detach().item()
-                batch_loss.backward()
-                optimizer.step()
-            scheduler.step()
-            weighted_loss = 0.0
-            for name in epoch_loss:
-                epoch_loss[name] /= idx + 1
-                weighted_loss += self.loss_weights.get(name, 1.0) * epoch_loss[name]
-                logger.debug(f'Epoch {_ + 1} || Output variable {name} || Avg MSE loss = {epoch_loss[name]}')
-            logger.debug(f'Epoch {_ + 1} || Weighted MSE loss = {weighted_loss}')
-        
-        weighted_original_loss = 0.0
-        for name in original_loss:
-            logger.info(f'{name} || Original Loss {original_loss[name] :.5f} || LSQ Loss {epoch_loss[name] :.5f}')
-            weighted_original_loss += self.loss_weights.get(name, 1.0) * original_loss[name]
-        logger.info(f'Original weighted loss {weighted_original_loss :.5f} || LSQ weighted loss {weighted_loss :.5f}')
-
-        for cfg, delegator in all_params.items():
-            if weighted_loss < weighted_original_loss:
-                delegator.finalize()
-            executor.remove_quantize_delegate(cfg)
-
-        if weighted_original_loss < weighted_loss:
-            logger.warning('Loss not improved, abandon trained values...')
-
-        for blk in blocks:
-            self.disable_grad(blk)
-            if weighted_original_loss < weighted_loss:
-                self.recover(blk)
-
-
     def optimize(self, processer: GraphCommandProcesser, 
                  dataloader: Iterable, executor: BaseGraphExecutor,
                  collate_fn: Callable,
                  **kwargs) -> None:
         graph = processer.graph
-        assert not(self.interested_layers_only and len(self.interested_layers) == 0), "you must specify interested_layers\
-        when interested_layers_only is set to True"
-        if self.interested_layers_only:
-            # only tune interested_layers
-            blocks = find_all_blocks(graph, executor._executing_order, block_limit=1)
-        else:
-            # tune whole subgraph which contains interested ops
-            blocks = find_all_blocks(graph, executor._executing_order)
-
+        blocks = find_all_blocks(graph, executor._executing_order)
         if len(self.interested_layers) == 0:
             logger.info('No layers are given, all blocks will be tuned by default')
             final_blocks = blocks
@@ -1007,13 +946,7 @@ class LearningStepSizeOptimization(TrainingBasedPass):
             for blk in blocks:
                 if any([op.name in self.interested_layers for op in blk.rps]):
                     final_blocks.append(blk)
-
-        if self.mode == 'global':
-            logger.info('Begin Globalwise LSQ Optimization ...')
-            self.LSQ_optimize_global(final_blocks, graph, dataloader, collate_fn, executor)
-        else:
-            logger.info('Begin Localwise LSQ Optimization ...')
-            self.LSQ_optimize_local(final_blocks, graph, dataloader, collate_fn, executor)
+        self.LSQ_optimize(final_blocks, graph, dataloader, collate_fn, executor)
 
 
 class AdvancedQuantOptimization(TrainingBasedPass):
@@ -1101,14 +1034,14 @@ class AdvancedQuantOptimization(TrainingBasedPass):
         dataset = RandomMemDataset(data=[[qt, fp] for qt, fp in zip(quant_inputs, fp32_outputs)])
 
         # create trainable delegators for each parameter.
-        trainable_vars = []
+        trainable_params = []
         for operation in block.rps:
             if operation.is_computing_op and isinstance(operation, QuantableOperation):
                 for cfg, var in operation.config_with_variable:
                     if not var.is_parameter: continue
-                    trainable_vars.append((var, cfg))
+                    trainable_params.append((var, cfg))
     
-        delegators = [RQTDelegator(config=cfg, limit=self.limit, binding=var) for var, cfg in trainable_vars]     
+        delegators = [RQTDelegator(config=cfg, limit=self.limit, binding=var) for var, cfg in trainable_params]     
         optimizer = torch.optim.Adam(params=[d.binding.value for d in delegators], lr=self.lr)
         shcduler  = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lambda t: 1 / (1 << (t // 5000)))
         # register all quantization delegators
@@ -1160,6 +1093,7 @@ class AdvancedQuantOptimization(TrainingBasedPass):
     def optimize(
         self, processer: GraphCommandProcesser, dataloader: Iterable,
         executor: TorchExecutor, collate_fn: Callable, **kwargs) -> None:
+        if self._verbose: self.report()
 
         if self._interested_outputs is None:
             self._interested_outputs = [name for name in processer.graph.outputs]
@@ -1245,6 +1179,19 @@ class AdvancedQuantOptimization(TrainingBasedPass):
             fp32_outputs.clear()
             quant_inputs.clear()
             empty_cache()
+
+    def report(self):
+        print('')
+        print('Check your Configuration Again, PPQ fine-tuning procedure will take a few minutes.')
+        print('-----------------------------------------')
+        print(f'Learning Rate:     {self.lr}')
+        print(f'Block Depth:       {OPTIM_ADVOPT_GRAPH_MAXDEPTH}')
+        print(f'Check Flag:        {self.check_flag}')
+        print(f'Training Steps:    {self.target_step}')
+        print(f'Interested Layers: {self.interested_layers}')
+        print(f'Finetune Limit:    {self.limit}')
+        print(f'Cache Device:      {self.collecting_device}')
+        print('-----------------------------------------')
 
 
 class LearningToCalibPass(TrainingBasedPass):

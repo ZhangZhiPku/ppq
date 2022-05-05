@@ -165,7 +165,7 @@ class TensorRTExporter(ONNXRUNTIMExporter):
 
     @ property
     def required_opsets(self) -> Dict[str, int]:
-        extra_domain_versions = [("ai.onnx", 11)]
+        extra_domain_versions = [("ai.onnx", 11)] # must be opset 11
         return dict(extra_domain_versions)
 
     def export(self, file_path: str, graph: BaseGraph, 

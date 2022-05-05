@@ -2,7 +2,7 @@ from typing import Union
 
 import torch
 from ppq.IR import Operation
-from ppq.core import (ChannelwiseTensorQuantizationConfig, OperationMeta,
+from ppq.core import (ChannelwiseTensorQuantizationConfig,
                       OperationQuantizationConfig, QuantizationPolicy,
                       QuantizationProperty, QuantizationStates, RoundingPolicy,
                       TargetPlatform)

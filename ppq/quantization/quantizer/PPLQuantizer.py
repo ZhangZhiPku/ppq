@@ -105,7 +105,7 @@ class PPLCUDAQuantizer(BaseQuantizer):
             'GlobalMaxPool', 'GlobalAveragePool',
             'Mul', 'Add', 'LeakyRelu', 'Split', 'Concat',
             'Transpose', 'Slice', 'Reshape', 'Flatten',
-            'Sigmoid'
+            'Sigmoid', 'ReduceMean'
         }
 
     @ property

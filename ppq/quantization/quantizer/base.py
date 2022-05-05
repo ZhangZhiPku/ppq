@@ -14,6 +14,7 @@ from ppq.IR.base.graph import Operation
 from ppq.IR.morph import GraphReplacer
 from ppq.IR.quantize import QuantableVariable
 from ppq.IR.search import SearchableGraph
+from ppq.executor.torch import TorchExecutor
 from ppq.quantization.optim import *
 
 
@@ -323,13 +324,9 @@ class BaseQuantizer(metaclass = ABCMeta):
             lsq_setting = setting.lsq_optimization_setting
             list_of_passes.append(LearningStepSizeOptimization(
                 interested_layers      = lsq_setting.interested_layers,
-                interested_layers_only = lsq_setting.interested_layers_only,
-                output_names           = lsq_setting.output_names,
-                loss_weights           = lsq_setting.loss_weights,
                 epochs                 = lsq_setting.epochs,
                 lr                     = lsq_setting.lr,
                 scale_multiplier       = lsq_setting.scale_multiplier,
-                mode                   = lsq_setting.mode
             )
         )
         
@@ -368,8 +365,7 @@ class BaseQuantizer(metaclass = ABCMeta):
         )
         if setting.quantize_parameter:
             if param_setting.baking_parameter:
-                list_of_passes.append(ParameterBakingPass(
-                    quantize_function=executor.quantize_function))
+                list_of_passes.append(ParameterBakingPass())
             
         if setting.extension:
             list_of_passes.append(ExtensionPass(
