@@ -12,6 +12,7 @@ from ppq.IR import (BaseGraph, GraphExporter, Operation, OperationExporter,
                     Variable)
 from ppq.IR.morph import GraphDeviceSwitcher
 from ppq.IR.quantize import QuantableOperation
+from ppq.core.defs import ppq_warning
 
 
 class ConstantOfShapeExporter(OperationExporter):
@@ -121,6 +122,11 @@ class OnnxExporter(GraphExporter):
             dtype = variable.meta.dtype.value
         else:
             shape, dtype = None, None
+
+        if dtype is None:
+            ppq_warning(f'Data type of Variable {variable.name} is not correctly traced, '
+                        'ppq will export it as fp32 variable to onnx.')
+            dtype = DataType.FP32.value
 
         if not variable.is_parameter:
             tensor_proto = helper.make_tensor_value_info(

@@ -48,6 +48,11 @@ class Path(Iterable):
     def tolist(self) -> List[Operation]:
         return list(self._container)
 
+    def copy(self):
+        c = Path()
+        c._container = self._container.copy()
+        return c
+
 
 class OperationSet(set):
     def __init__(self) -> None:
@@ -472,7 +477,7 @@ class SearchableGraph(GraphCommandProcesser):
                 # searching following operations.
                 for path in self._path_matching(start_point=op, rp_expr=rp_expr, 
                     ep_expr=ep_expr, direction=direction):
-                    ret_collection.append(path.append_left(start_point))
+                    ret_collection.append(path.copy().append_left(start_point))
 
         self._cache[start_point] = ret_collection
         return ret_collection
@@ -520,7 +525,7 @@ class SearchableGraph(GraphCommandProcesser):
         sp_expr: Callable, 
         rp_expr: Callable,
         ep_expr: Callable,
-        direction: str = 'up'
+        direction: str
         ) -> List[Path]:
         """
         path_matching is used for path searching on the
