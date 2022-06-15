@@ -1,12 +1,11 @@
+import logging
 import numpy as np
-from ppq.core.data import (DataType, convert_any_to_numpy,
-                           convert_any_to_python_primary_type)
-from ppq.IR import Operation
-from ppq.log import NaiveLogger
 
+from ppq.core.data import DataType, convert_any_to_numpy, convert_any_to_python_primary_type
+from ppq.IR import Operation
 from . import ppl_caffe_pb2
 
-logger = NaiveLogger.get_logger('PPQ')
+logger = logging.getLogger('PPQ')
 caffe_export_map = {}
 
 
@@ -61,7 +60,7 @@ class CaffeOpExporter(object):
     def set_attr(self):
         pass
 
-    def parse(self) -> ppl_caffe_pb2.LayerParameter:
+    def parse(self):
         self.set_attr()
         self.layer.bottom[:] = [var.name for var in self.op.inputs if not var.is_parameter]
         self.layer.top[:] = [var.name for var in self.op.outputs]

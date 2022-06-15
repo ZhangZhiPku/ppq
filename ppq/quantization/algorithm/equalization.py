@@ -194,7 +194,7 @@ class EqualizationPair:
 
             elif downstream_layer.type == 'Gemm':
                 weight, bias = self.get_linear_params(downstream_layer, False)
-                weight *= torch.reshape(scale, (1, -1))
+                weight /= torch.reshape(scale, (1, -1))
 
                 self.set_linear_params(downstream_layer, bias, weight)
 
@@ -258,6 +258,8 @@ class EqualizationPair:
         if including_bias and len(linear.parameters) > 1:
             bias = linear.parameters[1].value
 
+        if not linear.attributes.get('transB', 0):
+            weight = torch.transpose(weight, 1, 0)
         if bias is not None: return weight, bias
         else: return [weight, None]
 
@@ -285,7 +287,9 @@ class EqualizationPair:
 
         assert linear.type == 'Gemm', (
             'Except input object with type Gemm, but %s got' % linear.type)
-
+        
+        if not linear.attributes.get('transB', 0):
+            weight = torch.transpose(weight, 1, 0)
         linear.parameters[0].value = weight
         if bias is not None and len(linear.parameters) > 1:
             linear.parameters[1].value = bias
@@ -321,7 +325,7 @@ class EqualizationPair:
             return torch.max(torch.square(params), axis=aggerate_axis)[0]
 
         elif method is EqualizationMethod.SQUARE_MEAN:
-            return torch.mean(torch.abs(params), axis=aggerate_axis)
+            return torch.mean(torch.square(params), axis=aggerate_axis)
             
         else:
             raise NotImplementedError('Equalization method %s is not support.' % str(method))

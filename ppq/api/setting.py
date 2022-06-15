@@ -1,5 +1,5 @@
 import json
-import copy
+
 from ppq.core import *
 
 
@@ -10,11 +10,11 @@ class GraphFormatSetting():
         # this pass will convert constant operation into parameter variable(if can be done).
         self.format_constant_op = True
         
-        # 融合Conv和Batchnorm
+        # 融合Conv和Batchnorm，不开这个 pass 八成要崩
         # Fuse Conv and Batchnorm Layer. This pass is necessary and curicial.
         self.fuse_conv_bn       = True
         
-        # 将所有的parameter variable进行分裂，使得每个variable具有至多一个输出算子
+        # 将所有的parameter variable进行分裂，使得每个variable具有至多一个输出算子，不开八成也要崩
         # Split all parameter variables, making all variable has at most 1 output operation. 
         # This pass is necessary and curicial.
         self.format_paramters   = True
@@ -23,7 +23,8 @@ class GraphFormatSetting():
         # This pass is necessary and curicial.
         self.format_cast        = True
         
-        # 尝试从网络中删除所有与输出无关的算子和 variable
+        # 尝试从网络中删除所有与输出无关的算子和 variable，注意有一些平台很无聊，
+        # 喜欢把量化参数秃着写在网络里，在这种情况下开启这个选项就要崩了。
         # Remove all unnecessary operations and variables(which are not link to graph output) from current graph,
         # notice that some platfrom use unlinked variable as quantization parameters, do not set this as true if so.
         self.delete_isolate     = True
@@ -129,9 +130,9 @@ class AdvancedOptimizationSetting():
         # cpu - store data to cpu memory.
         self.collecting_device    = 'executor' # executor or cpu
         
-        # 每一轮迭代后是否校验优化结果，开启后延长执行时间，提升精度
+        # 每一轮迭代后是否校验优化结果，建议开启，延长执行时间，提升精度
         # whether to check optimization result after each iteration.
-        self.auto_check           = False
+        self.auto_check           = True
         
         # 偏移量限制，试试 2, 4, 10
         # offset limitation used in this optimziation, try 2, 4, 10
@@ -139,11 +140,11 @@ class AdvancedOptimizationSetting():
 
         # 学习率
         # learning rate.
-        self.lr                   = 1e-3
+        self.lr                   = 3e-4
         
         # 训练步数
         # training steps
-        self.steps                = 2500
+        self.steps                = 5000
         
         # 对那些层进行训练，默认为 空数组 则训练全部层
         # layers that need to be finetuned via this method.
@@ -311,7 +312,6 @@ class LearningStepSizeSetting():
         # some larger value in loss_weights, i.e., self.loss_weights = {some_output_1:2.0, some_output_2 : 5.0, ...}
         self.loss_weights           = {}
 
-
 class BlockwiseReconstructionSetting():
      def __init__(self) -> None:
         # if given, only block containing op in interested_layers will be optimized, otherwise every
@@ -319,15 +319,19 @@ class BlockwiseReconstructionSetting():
         self.interested_layers  = []
         # whether to tune activation scale
         self.tune_act_scale     = True
-        # initial learning rate, by default Adam optimizer
+        # initial learning rate, by default Adam optimizer and a multistep scheduler with 0.1 decay
         self.lr                 = 1e-3
-        # number of training epochs, 300 epochs would be enough for int8 networks
-        self.epochs             = 300
+        # number of training epochs = 20000iter / 32 = 625
+        self.epochs             = 625
         # loss = LpNormLoss + lamda * RoundingLoss
         self.lamda              = 1.0
-        # scale multiplifer for bias(passive quantized param)
+        # scale multiplifer for bias(negative quantized param)
         self.scale_multiplier   = 2.0
 
+class Dispatching():
+    def __init__(self, operation: str, platform: int) -> None:
+        self.operation = operation
+        self.platform  = platform
 
 
 class DispatchingTable():
@@ -337,15 +341,15 @@ class DispatchingTable():
         self.intro_2 = "Example above shows you how to edit a valid dispatching table."
         self.attention = "All operation names that can not be found with your graph will be ignored."
 
-        self.dispatchings = {
-            'YOUR OEPRATION NAME' : 'TARGET PLATFORM(INT)',
-            'FP32 OPERATION NAME' : TargetPlatform.FP32.value,
-            'SOI OPERATION NAME'  : TargetPlatform.SHAPE_OR_INDEX.value,
-            'DSP INT8 OPERATION NAME' : TargetPlatform.PPL_DSP_INT8.value,
-            'TRT INT8 OPERATION NAME' : TargetPlatform.TRT_INT8.value,
-            'NXP INT8 OPERATION NAME' : TargetPlatform.NXP_INT8.value,
-            'PPL INT8 OPERATION NAME' : TargetPlatform.PPL_CUDA_INT8.value
-        }
+        self.dispatchings = [
+            Dispatching(operation='YOUR OEPRATION NAME', platform='TARGET PLATFORM(INT)'),
+            Dispatching(operation='FP32 OPERATION NAME', platform=TargetPlatform.FP32.value),
+            Dispatching(operation='SOI OPERATION NAME', platform=TargetPlatform.SHAPE_OR_INDEX.value),
+            Dispatching(operation='DSP INT8 OPERATION NAME', platform=TargetPlatform.DSP_INT8.value),
+            Dispatching(operation='TRT INT8 OPERATION NAME', platform=TargetPlatform.TRT_INT8.value),
+            Dispatching(operation='NXP INT8 OPERATION NAME', platform=TargetPlatform.NXP_INT8.value),
+            Dispatching(operation='PPL INT8 OPERATION NAME', platform=TargetPlatform.PPL_CUDA_INT8.value),
+        ]
     
     def append(self, operation: str, platform: Union[int, TargetPlatform]):
         assert isinstance(platform, int) or isinstance(platform, TargetPlatform), (
@@ -354,7 +358,7 @@ class DispatchingTable():
             f'however {type(platform)} was given.'
         )
         if isinstance(platform, TargetPlatform): platform = platform.value
-        self.dispatchings.update({operation: platform})
+        self.dispatchings.append(Dispatching(operation, platform))
 
 
 class QuantizationSetting():
@@ -473,11 +477,9 @@ class QuantizationSettingFactory:
         return default_setting
 
     @ staticmethod
-    def from_json(json_obj: Union[str, dict]) -> QuantizationSetting:
+    def from_json(json_str: str) -> QuantizationSetting:
         setting = QuantizationSetting()
-        if isinstance(json_obj, str):
-            setting_dict = json.loads(json_obj)
-        else: setting_dict = json_obj
+        setting_dict = json.loads(json_str)
         
         if 'version' not in setting_dict:
             ppq_warning('Can not find a valid version from your json input, input might not be correctly parsed.')
@@ -493,19 +495,12 @@ class QuantizationSettingFactory:
                             f'expect a dictionary deserialzed from json here, '
                             f'however {type(setting_dict)} was given.')
         
-        def assign(obj_setting: dict, obj: object):
-            for key, value in obj_setting.items():
-                if key in obj.__dict__:
-                    if 'builtin' in obj.__dict__[key].__class__.__module__:
-                        obj.__dict__[key] = copy.deepcopy(value)
-                    else:
-                        assert isinstance(value, dict)
-                        assign(value, obj.__dict__[key])
-                else:
-                    ppq_warning(
-                    f'Unexpected attribute ({key}) was found in {obj.__class__.__name__}. '
+        for key, value in setting_dict.items():
+            if key in setting.__dict__:
+                setting.__dict__[key] = value
+            else:
+                ppq_warning(
+                    f'Unexpected attribute ({key}) was found. '
                     'This might because you are using a setting generated by PPQ with another version. '
                     'We will continue setting loading progress, while this attribute will be skipped.')
-
-        assign(setting_dict, setting)
         return setting

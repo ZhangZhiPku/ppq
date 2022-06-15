@@ -1,4 +1,4 @@
-from typing import Dict, Set
+from typing import Dict
 
 from ppq.core import TargetPlatform
 from ppq.IR import BaseGraph
@@ -27,7 +27,7 @@ class AggresiveDispatcher(GraphDispatcher):
     """
     @staticmethod
     def dispatch(
-        graph: BaseGraph, quant_types: Set[str],
+        graph: BaseGraph, 
         quant_platform: TargetPlatform, 
         fp32_platform: TargetPlatform, 
         SOI_platform: TargetPlatform, 
@@ -51,8 +51,6 @@ class AggresiveDispatcher(GraphDispatcher):
 
         Args:
             graph (BaseGraph): graph object which going to be dispatched by this dispatcher.
-            
-            quant_types(Set[str]): all quantable types for given platforms.
             
             quant_platform (TargetPlatform): 
                 platform object where quantable parts will goes to.
@@ -149,7 +147,7 @@ class ConservativeDispatcher(GraphDispatcher):
     """
     @staticmethod
     def dispatch(
-        graph: BaseGraph, quant_types: Set[str],
+        graph: BaseGraph, 
         quant_platform: TargetPlatform, 
         fp32_platform: TargetPlatform, 
         SOI_platform: TargetPlatform, **kwargs
@@ -173,8 +171,6 @@ class ConservativeDispatcher(GraphDispatcher):
         Args:
             graph (BaseGraph): graph object which going to be dispatched by this dispatcher.
             
-            quant_types(Set[str]): all quantable types for given platforms.
-            
             quant_platform (TargetPlatform): 
                 platform object where quantable parts will goes to.
 
@@ -187,15 +183,21 @@ class ConservativeDispatcher(GraphDispatcher):
         Returns:
             Dict[str, TargetPlatform]: [description]
         """
+        quantable_types = {
+            'Conv', 'ConvTranspose', 'Gemm', 'Relu', 'PRelu', 'Clip', 'Pad',
+            'Resize', 'MaxPool', 'AveragePool', 'GlobalMaxPool', 'GlobalAveragePool',
+            'Mul', 'Add', 'Max', 'Sub', 'Div', 'LeakyRelu', 'Split', 'Concat',
+            'Reshape', 'Transpose', 'Slice', 'Flatten', 'Softmax'}
+
         recivers, generators = SOI_receivers(graph), SOI_generators(graph)
         search_engine, SOI_opeartions = SearchableGraph(graph), set(recivers)
 
         quant_operations = search_engine.opset_matching(
             sp_expr = lambda x: x.is_computing_op,
             rp_expr = value_tracing_pattern,
-            ep_expr = lambda x: (x.type not in quant_types) or x.is_boundary,
+            ep_expr = lambda x: (x.type not in quantable_types) or x.is_boundary,
             direction = 'down')
-        quant_operations.filter(lambda x: x.type not in quant_types)
+        quant_operations.filter(lambda x: x.type not in quantable_types)
 
         computing_extensions = search_engine.opset_matching(
             sp_expr = lambda x: x.is_computing_op,
@@ -288,7 +290,7 @@ class PPLNNDispatcher(GraphDispatcher):
     """
     @staticmethod
     def dispatch(
-        graph: BaseGraph, quant_types: Set[str],
+        graph: BaseGraph, 
         quant_platform: TargetPlatform, 
         fp32_platform: TargetPlatform, 
         SOI_platform: TargetPlatform, **kwargs
@@ -312,8 +314,6 @@ class PPLNNDispatcher(GraphDispatcher):
         Args:
             graph (BaseGraph): graph object which going to be dispatched by this dispatcher.
             
-            quant_types(Set[str]): all quantable types for given platforms.
-            
             quant_platform (TargetPlatform): =
                 platform object where quantable parts will goes to.
 
@@ -326,6 +326,12 @@ class PPLNNDispatcher(GraphDispatcher):
         Returns:
             Dict[str, TargetPlatform]: [description]
         """
+        quant_types = {
+            'Conv', 'Relu', 'PRelu', 'Clip',
+            'Resize', 'MaxPool', 'AveragePool', 'GlobalMaxPool', 'GlobalAveragePool',
+            'Mul', 'Add', 'LeakyRelu', 'Split', 'Concat',
+            'Transpose', 'Slice', 'Reshape', 'Flatten', 'Softmax'}
+
         recivers, generators = SOI_receivers(graph), SOI_generators(graph)
         search_engine, SOI_opeartions = SearchableGraph(graph), set(recivers)
 

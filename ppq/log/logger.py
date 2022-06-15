@@ -1,9 +1,7 @@
-import os
 import sys
 import time
 from enum import Enum
 from typing import Union
-import warnings
 
 R_BEGIN = "\033[38;5;1m"
 G_BEGIN = "\033[38;5;2m"
@@ -51,7 +49,7 @@ class Handler:
 
     def process(self, msg: str, level: LEVEL) -> None:
         if self._level <= level:
-            self._fd.write(msg + '\n')
+            self._fd.write('\r' + msg + '\n')
             self._fd.flush()
 
     def set_level(self, level: LEVEL) -> None:
@@ -128,7 +126,16 @@ class NaiveLogger(object):
                 handler.process(msg, LEVEL.ERROR)
             else:
                 handler.process(print_msg, LEVEL.ERROR)
+    
+    def debug(self, msg: str):
+        msg = self.wrap_header(msg, 'DEBUG')
+        print_msg = G_BEGIN + msg + COLOR_END
 
+        for handler in self._handlers.values():
+            if handler._file_name is not None:
+                handler.process(msg, LEVEL.DEBUG)
+            else: 
+                handler.process(print_msg, LEVEL.DEBUG)
 
     def register_handler(self, file_name: str, level: Union[str, LEVEL]=LEVEL.INFO):
         if file_name not in self._handlers:

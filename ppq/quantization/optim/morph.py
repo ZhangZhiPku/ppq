@@ -1,3 +1,4 @@
+import logging
 from math import ceil
 from typing import Iterable, List
 
@@ -9,13 +10,12 @@ from ppq.IR import BaseGraph, GraphCommandProcesser, Operation, Variable
 from ppq.IR.morph import GraphReplacer
 from ppq.IR.quantize import QuantableOperation
 from ppq.IR.search import Path, SearchableGraph
-from ppq.log import NaiveLogger
 from ppq.quantization.observer import TensorObserverFactroy
 from tqdm import tqdm
 
 from .base import QuantizationOptimizationPass
 
-logger = NaiveLogger.get_logger('PPQ')
+logger = logging.getLogger('PPQ')
 
 
 class NXPResizeModeChangePass(QuantizationOptimizationPass):

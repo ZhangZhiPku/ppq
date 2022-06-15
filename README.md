@@ -1,16 +1,24 @@
+# PPL Quantization Tool 0.6.1(PPL 量化工具)
 
-<div align="center">
-  <img src="doc/assets/img/banner.jpg" width="1280"/>
-</div>
+PPL Quantization Tool (PPQ) is a powerful offline neural network quantization tool with custimized IR, executor, dispacher and optimization passes.
 
-# PPL Quantization Tool 0.6.3(PPL 量化工具)
-PPL Quant Tool (PPQ) is a highly efficient offline neural network quantization tool with custimized IR, executor, dispacher and optimization passes.
+# What's New with PPQ 0.6
+
+* Fully redesigned network analysis tools and functions
+* Blockwise(Subgraph level) Optimization Methods
+* OnnxRuntime Quant&Dequant Format Export
+* 4 & 8 mix precision quantization (exprimental)
+* Matrix Factorization Pass (exprimental)
+
+<iframe src="//player.bilibili.com/player.html?aid=682632207&bvid=BV1WS4y1N7Kn&cid=562252925&page=1" scrolling="no" border="0" frameborder="no" framespacing="0" allowfullscreen="true"> </iframe>
 
 <iframe src="//player.bilibili.com/player.html?aid=682632207&bvid=BV1WS4y1N7Kn&cid=562252925&page=1" scrolling="no" border="0" frameborder="no" framespacing="0" allowfullscreen="true"> </iframe>
 
 # Features
-* Quantizable IR, an quantization-oriented network representation.
-* Quant related cuda kernels. with ppq, quantization simulating and finetuning will be 3x ~ 50x faster than ever.
+
+* Quantable graph, an quantization-oriented network representation.
+* Quantize with Cuda, quantization simulating are 3x ~ 50x faster than PyTorch.
+* Hardware-friendly, simulating calculations are mostly identical with hardware.
 * Multi-platform support.
 
 # Installation
@@ -22,17 +30,6 @@ ATTENTION: For users of pytorch, pytorch might bring you a minimized CUDA librar
 
 ATTENTION: Make sure your python version is >= 3.6.0. PPL Quantization Tool is written with dialects that only supported by python >= 3.6.0.
 
-* Install dependencies:
-    * For Linux User, use following command to install ninja:
-    ```bash
-    sudo apt install ninja-build
-    ```
-
-    * For Windows User:
-        * Download ninja.exe from [https://github.com/ninja-build/ninja/releases](https://github.com/ninja-build/ninja/releases), add it to Windows PATH Environment
-        * Download Visual Studio from [https://visualstudio.microsoft.com](https://visualstudio.microsoft.com/zh-hans/), if you already got a c++ compiler, you can skip this step.
-        * Add your c++ compiler to Windows PATH Environment, if you are using Visual Studio, it should be something like "C:\Program Files\Microsoft Visual Studio\2017\Community\VC\Tools\MSVC\14.16.27023\bin\Hostx86\x86"
-
 * Install PPQ from source:
 
 1. Run following code with your terminal(For windows user, use command line instead).
@@ -40,7 +37,6 @@ ATTENTION: Make sure your python version is >= 3.6.0. PPL Quantization Tool is w
 ```bash
 git clone https://github.com/openppl-public/ppq.git
 cd ppq
-pip install -r requirements.txt
 python setup.py install
 ```
 
@@ -52,7 +48,19 @@ python setup.py install
 
 ```bash
 python3 -m pip install ppq
-``` 
+```
+
+* Install dependencies:
+    * For Linux User, use following command to install ninja:
+    ```bash
+    sudo apt install ninja-build
+    ```
+
+    * For Windows User:
+        * Download ninja.exe from [https://github.com/ninja-build/ninja/releases](https://github.com/ninja-build/ninja/releases), add it to Windows PATH Environment
+        * Download Visual Studio from [https://visualstudio.microsoft.com](https://visualstudio.microsoft.com/zh-hans/), if you already got a c++ compiler, you can skip this step.
+        * Add your c++ compiler to Windows PATH Environment, if you are using Visual Studio, it should be something like "C:\Program Files\Microsoft Visual Studio\2017\Community\VC\Tools\MSVC\14.16.27023\bin\Hostx86\x86"
+    
 
 # Tutorials and Examples
 

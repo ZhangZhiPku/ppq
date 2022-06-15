@@ -1,3 +1,4 @@
+import logging
 import operator
 from functools import reduce
 from typing import List
@@ -5,7 +6,6 @@ from typing import List
 import numpy as np
 from ppq.core import DataType, convert_any_to_python_primary_type
 from ppq.IR import Operation
-from ppq.log import NaiveLogger
 from ppq.utils import process_attribute
 
 import torch
@@ -34,7 +34,7 @@ __all__ = [
     'InstanceNormalization_forward', 'Parameter_forward', 'Interp_forward', 'CaffeArgMax_forward',
     'DEFAULT_BACKEND_TABLE',
 ]
-logger = NaiveLogger.get_logger('PPQ')
+logger = logging.getLogger('PPQ')
 
 def Conv_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendContext = None, **kwargs) -> torch.Tensor:
     """
@@ -888,7 +888,7 @@ def Clip_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendCon
     if len(values) == 1:
         values.append(op.attributes.get('min', float('-inf')))
         values.append(op.attributes.get('max', float('+inf')))
-    output = torch.clamp(*values)
+    output = torch.clip(*values)
     return output
 
 
@@ -1612,7 +1612,6 @@ def RoiAlign_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBacken
 
 def MMCVRoiAlign_forward(op: Operation, values: List[torch.Tensor], ctx: TorchBackendContext = None, **kwargs) -> torch.Tensor:
     from mmcv.ops import roi_align as mmcv_roi_align
-
     # ASSERT_ALL_TENSORS_AT_SAME_DEVICE(op=op, values=values)
     ASSERT_NUM_OF_INPUT(op=op, values=values, min_num_of_input=2, max_num_of_input=2)
 

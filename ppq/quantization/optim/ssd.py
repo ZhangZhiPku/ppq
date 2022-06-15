@@ -1,26 +1,23 @@
 from math import ceil
-from typing import Callable, Dict, Iterable, List, Set
-
-import torch
-import torch.nn.functional as F
-from ppq.core import (ChannelwiseTensorQuantizationConfig,
-                      QuantizationProperty, QuantizationStates)
-from ppq.executor import BaseGraphExecutor
-from ppq.executor.base import GLOBAL_DISPATCHING_TABLE
+from ppq.IR.base.graph import BaseGraph
 from ppq.IR import (GraphCommandProcesser, Operation, QuantableOperation,
                     Variable)
-from ppq.IR.base.graph import BaseGraph
 from ppq.IR.search import Path, SearchableGraph, TraversalCommand
-from ppq.log import NaiveLogger
-from ppq.quantization.measure import torch_mean_square_error
+from ppq.core import QuantizationStates, ChannelwiseTensorQuantizationConfig,\
+    QuantizationProperty
+from ppq.executor import BaseGraphExecutor
+from ppq.executor.base import GLOBAL_DISPATCHING_TABLE
 from ppq.quantization.observer import CalibrationHook, OperationObserver
 from ppq.quantization.observer.range import TorchHistObserver
 from ppq.quantization.qfunction import BaseQuantFunction
 from ppq.quantization.qfunction.linear import PPQLinearQuantFunction
-
+from ppq.quantization.measure import torch_mean_square_error
 from .base import QuantizationOptimizationPass
-
-logger = NaiveLogger.get_logger('PPQ')
+from typing import Callable, Dict, Iterable, List, Set
+import torch
+import torch.nn.functional as F
+import logging
+logger = logging.getLogger('PPQ')
 
 
 OPTIMIZATION_LAYERTYPE_CONFIG = {
@@ -176,7 +173,7 @@ class SSDEqualizationPass(QuantizationOptimizationPass):
         second_weight = second_weight.permute(2, 0, 1, *(range(len(second_weight.shape))[3:])).contiguous()
         second_weight_range = second_weight.reshape(second_weight.shape[0] * second_weight.shape[1], -1).abs().max(1)[0]
         scale = torch.sqrt(second_weight_range / (first_weight_range + eps))
-        scale = torch.clamp(scale, min_scale, max_scale)
+        scale = torch.clip(scale, min_scale, max_scale)
 
         pair[0].parameters[0].value = op_first_weight * scale.reshape((-1,) + (1,)*(len(op_first_weight.shape) - 1))
         if len(pair[0].parameters) > 1:
@@ -233,13 +230,13 @@ class SSDEqualizationPass(QuantizationOptimizationPass):
             kernel_scale = kernel_scale / next_kernel_scale
             act_scale = act_scale / next_kernel_scale
             min_scale = torch.min(kernel_scale, act_scale)
-            min_scale = torch.min(min_scale, torch.tensor(default_min_scale, dtype=torch.float32, device=min_scale.device))
+            min_scale = torch.min(min_scale, torch.tensor(default_min_scale, dtype=torch.float32))
             min_scale /= min_scale.min()
-            min_scale = torch.clamp(min_scale, 1.0, max_scale)
+            min_scale = torch.clip(min_scale, 1.0, max_scale)
         else:
             kernel_scale = (kernel_scale / next_kernel_scale).sqrt()
             min_scale = (act_scale * kernel_scale).sqrt()
-            min_scale = torch.clamp(min_scale, 1.0, max_scale)
+            min_scale = torch.clip(min_scale, 1.0, max_scale)
 
 
         pair[0].parameters[0].value = op_first_weight * min_scale.reshape((-1,) + (1,)*(len(op_first_weight.shape) - 1))

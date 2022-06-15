@@ -1,7 +1,7 @@
-from ppq.log import NaiveLogger
-from ppq.core.defs import ppq_legacy
+import logging
 
-logger = NaiveLogger.get_logger('PPQ')
+from ppq.core.defs import ppq_legacy
+logger = logging.getLogger('PPQ')
 
 # attribute checker and preprocess
 def process_attribute(attr, input_shape, kernel_shape=None, op_type=None):

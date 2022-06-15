@@ -31,7 +31,7 @@ class ORT_PerTensorQuantizer(BaseQuantizer):
             rounding=self.rounding_policy,
         )
 
-        if operation.type in {'Conv'}:
+        if operation.type in {'Conv', 'Gemm'}:
             # if operation has bias
             if operation.num_of_input == 3:
                 bias_config = base_quant_config.input_quantization_config[-1]
@@ -68,8 +68,9 @@ class ORT_PerTensorQuantizer(BaseQuantizer):
     def quant_operation_types(self) -> set:
         return {
             'Conv', 'GlobalAveragePool', 'AveragePool',
-            'Relu', 'Add', 'Mul', 'Clip',
-            'MatMul'
+            'Relu', 'Add', 'Mul', 'Clip', 'Sigmoid',
+            'MatMul', 'ReduceMean', 'Gemm', 'Concat',
+            'LeakyRelu',
         }
 
     @ property
@@ -144,7 +145,7 @@ class ORT_PerChannelQuantizer(BaseQuantizer):
                             )
                         base_quant_config.input_quantization_config[index].observer_algorithm = 'Minmax'
             # if operation has bias
-            if operation.type == 'Conv' and operation.num_of_input > 2:
+            if operation.type in {'Conv', 'Gemm'} and operation.num_of_input > 2:
                 bias_config = base_quant_config.input_quantization_config[-1]
                 bias_config.policy = QuantizationPolicy(
                     QuantizationProperty.SYMMETRICAL +
@@ -179,8 +180,9 @@ class ORT_PerChannelQuantizer(BaseQuantizer):
     def quant_operation_types(self) -> set:
         return {
             'Conv', 'GlobalAveragePool', 'AveragePool',
-            'Relu', 'Add', 'Mul', 'Clip',
-            'MatMul'
+            'Relu', 'Add', 'Mul', 'Clip', 'Sigmoid',
+            'MatMul', 'ReduceMean', 'Gemm', 'Concat', 
+            'LeakyRelu'
         }
 
     @ property

@@ -28,13 +28,13 @@ class OnnxExporter(GraphExporter):
 
     def export_quantization_config(
         self, config_path: str, graph: BaseGraph):
-
+        
         render_buffer = {
             'configs': {},
             'dispatchings' : {},
             'values': {}
         }
-
+        
         # Render quantization config.
         for operation in graph.operations.values():
             if isinstance(operation, QuantableOperation):
@@ -122,7 +122,7 @@ class OnnxExporter(GraphExporter):
                     value = convert_any_to_numpy(variable.value).flatten()
                 elif value.ndim == 0:
                     value = [value.item(), ] # it is fine for onnx, cause shape for this value will be []
-            else: value = value # value is python primary type.
+            else: value = value # value is numpy.ndarray or python primary type.
             tensor_proto = helper.make_tensor(
                 name=variable.name, data_type=dtype,
                 dims=shape, vals=value)

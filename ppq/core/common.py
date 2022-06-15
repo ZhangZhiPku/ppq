@@ -17,10 +17,6 @@ OBSERVER_MSE_HIST_BINS = 8192
 
 # PPLCUDA 中所有需要与 Conv 融合的激活函数
 PPLCUDA_ACTIVATIONS = {'Clip', 'LeakyRelu', 'Relu', 'Sigmoid'}
-
-ORT_OOS_FUSE_START_OPS = {'Conv', 'GlobalAveragePool', 'AveragePool', 'Add', 'Mul', 'Matmul'}
-ORT_MICROSOFT_CONTRIB_LINEAR_OPS = {'Add', 'Mul'}
-
 # PASSIVE OPERATIONS 是那些不参与计算的 Op, 这些 op 的输入与输出将直接共享 scale
 PASSIVE_OPERATIONS = {
     'Resize', 'MaxPool', 'GlobalMaxPool', 'Reshape',
@@ -46,13 +42,10 @@ NUM_OF_CHECKPOINT_FETCHS = 4096
 # 误差容忍度
 CHECKPOINT_TOLERANCE = 1
 
-# SUB GRAPH 最大深度
-# PPQ 使用子图切割算法寻找子图，这个参数控制了子图的大小。
-OPTIM_ADVOPT_GRAPH_MAXDEPTH = 4
+# SUB GRAPH 中最多计算算子的个数
+OPTIM_ADVOPT_GRAPH_MAXSIZE = 4
 # ROUNDING LOSS 系数
 OPTIM_ADVOPT_RLOSS_MULTIPLIER = 1
-# 是否使用 LR SCEHDULER
-OPTIM_ADVOPT_USING_SCEHDULER = True
 
 # ONNX 导出图的时候，producer的名字
 ONNX_EXPORT_NAME = 'PPL Quantization Tool - Onnx Export'
